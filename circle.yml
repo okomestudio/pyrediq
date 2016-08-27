@@ -11,6 +11,9 @@ machine:
     - redis
 
 test:
+  pre:
+    - pip install -U coveralls
   override:
     - bin/tests
-
+  post:
+    - coveralls

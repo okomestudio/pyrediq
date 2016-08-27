@@ -22,5 +22,3 @@ opts+=(--cov=pyrediq
        --log-format="%(asctime)s %(levelname)s %(thread)d %(message)s")
 
 pytest "${opts[@]}"
-
-# coverage report -m
