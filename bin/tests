@@ -1,0 +1,26 @@
+#!/bin/bash
+#
+# Run tests and report coverage.
+
+set -e
+
+# Tests to run can be specified explicitly or all tests are run:
+if [[ $# -eq 0 ]]; then
+  opts=(tests/)
+else
+  opts=$@
+fi
+
+for package in pytest pytest-cov pytest-capturelog ; do
+  if ! python -c "import ${package}" 2> /dev/null; then
+    pip install -U ${package}
+  fi
+done
+
+opts+=(--cov=pyrediq
+       --cov-report term-missing
+       --log-format="%(asctime)s %(levelname)s %(thread)d %(message)s")
+
+pytest "${opts[@]}"
+
+# coverage report -m
