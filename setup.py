@@ -23,6 +23,7 @@ setup(
     description='Priority Queue with Redis',
     version=find_version('pyrediq/__init__.py'),
     packages=['pyrediq'],
+    # package_dir={'pyrediq': 'lib'},
     scripts=[],
     url='https://github.com/okomestudio/pyrediq',
     install_requires=[
