@@ -1,0 +1,16 @@
+general:
+  branches:
+    only:
+      - master
+      - development
+
+machine:
+  python:
+    version: 2.7.11
+  service:
+    - redis
+
+test:
+  override:
+    - bin/tests
+
