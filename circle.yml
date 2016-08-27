@@ -12,17 +12,8 @@ machine:
 
 dependencies:
   override:
-    ->
-    if [[ ! -f setup.py ]]; then
-      echo "ERROR: setup.py not found; run from the package root directory."
-      exit 1
-    fi
-    cmd="import sys; sys.path.remove(''); import pyrediq"
-    if python -c "$cmd" 2> /dev/null; then
-      pip uninstall -y pyrediq
-    fi
-    pip install -e .
-    
+    - pip install -e .
+
 test:
   pre:
     - pip install -U coveralls
