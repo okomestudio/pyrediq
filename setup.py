@@ -15,18 +15,18 @@ def find_version(fpath):
         r"^__version__\s+=\s+['\"]([^'\"]*)['\"]", version_file, re.M)
     if matched:
         return matched.group(1)
-    raise RuntimeError('version string undefined')
+    raise Exception('Version string undefined')
 
 
 setup(
     name='pyrediq',
     description='Priority Queue with Redis',
     version=find_version('pyrediq/__init__.py'),
-    packages=[
-        'pyrediq'],
+    packages=['pyrediq'],
     scripts=[],
     url='https://github.com/okomestudio/pyrediq',
     install_requires=[
-        'gevent',
-        'msgpack-python',
-        'redis'])
+        'gevent==1.1.2',
+        'msgpack-python==0.4.8',
+        'python-redis-lock==3.1.0',
+        'redis==2.10.5'])

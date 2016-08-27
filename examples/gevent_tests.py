@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import
 import gevent.monkey ; gevent.monkey.patch_all()
-
 import logging
 import random
 import unittest
@@ -13,13 +12,16 @@ import redis
 from pyrediq.mq import MQ, MQConsumer, QueueEmpty
 
 
+log = logging.getLogger(__name__)
+
+
 class GEventTester(unittest.TestCase):
 
     # someone needs to write tests for testing these tests sort of
     # tests for now.
 
     def setUp(self):
-        # logging.basicConfig(level=logging.DEBUG)
+        logging.basicConfig(level=logging.INFO)
         self.redis = redis.StrictRedis()
 
     def tearDown(self):
@@ -55,7 +57,7 @@ class GEventTester(unittest.TestCase):
             def ticking_time_bomb():
                 raise KeyboardInterrupt
             if bomb:
-                gevent.spawn_later(2., ticking_time_bomb)
+                gevent.spawn_later(1., ticking_time_bomb)
 
             # this consumer does not do clean up action
             consumer = MQConsumer(mq)
@@ -63,8 +65,7 @@ class GEventTester(unittest.TestCase):
             self.consumer(consumer)
 
         gs = []
-        for i in xrange(1):
-            gs.append(gevent.spawn(self.producer, mq, i, 100))
+        gs.append(gevent.spawn(self.producer, mq, 0, 100))
 
         n_consumer = 3
         for i in xrange(n_consumer):
@@ -78,10 +79,13 @@ class GEventTester(unittest.TestCase):
         gevent.killall(gs)
         self.assertGreater(len(mq._orphaned_consumers(0)), 0)
 
-        mq = MQ(queue_name, self.redis)
-        # this should trigger clean-up and put all items in processing
-        # queue back to the priority queue
-        mq._clean_up_orphans(0.0)
+        gevent.joinall(gs)
+        gevent.sleep(2)
+
+        log.info(
+            'this should trigger clean-up and put all items in processing '
+            'queue back to the priority queue')
+        mq = MQ(queue_name, self.redis, orphan_idle_time=0.0)
         self.assertEqual(len(mq._orphaned_consumers(0)), 0)
 
         mq.purge()
@@ -92,22 +96,21 @@ class GEventTester(unittest.TestCase):
 
         def consume(mq, bomb=False):
             def ticking_time_bomb():
+                log.warning('Bomb!!')
                 raise KeyboardInterrupt
             if bomb:
-                gevent.spawn_later(0.1, ticking_time_bomb)
+                gevent.spawn_later(.2, ticking_time_bomb)
             with mq.consumer() as consumer:
                 self.consumer(consumer)
 
         gs = []
-        for i in xrange(1):
-            gs.append(gevent.spawn(self.producer, mq, i, 100))
-
-        n_consumer = 3
-        for i in xrange(n_consumer):
-            gs.append(gevent.spawn(consume, mq, bomb=(i == 0)))
+        gs.append(gevent.spawn(self.producer, mq, 0, 100))
 
         # this should leave some consumer queues abandoned
         with self.assertRaises(KeyboardInterrupt):
+            n_consumer = 3
+            for i in xrange(n_consumer):
+                gs.append(gevent.spawn(consume, mq, bomb=(i == 0)))
             gevent.joinall(gs)
         self.assertGreater(len(mq._orphaned_consumers(0)), 0)
 
@@ -132,6 +135,7 @@ class GEventTester(unittest.TestCase):
         try:
             gevent.joinall(gs)
         except Exception:
+            log.exception('Something bad happened')
             [g.kill() for g in gs]
 
         self.assertTrue(mq.is_empty())
