@@ -7,7 +7,7 @@ general:
 machine:
   python:
     version: 2.7.11
-  service:
+  services:
     - redis
 
 test:
