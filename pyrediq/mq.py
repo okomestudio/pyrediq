@@ -20,38 +20,64 @@ class QueueEmpty(Exception):
     pass
 
 
-class Message(dict):
+class Message(object):
     """Message to be passed around.
-
-    When deserialized, it is basically a dict object with keys
-    `payload`, `priority`, `_id`, and `_created` with the latter two
-    automatically assigned by the constructor.
 
     """
 
-    def __init__(self, payload=None, priority=0, _id=None, _created=None):
+    def __init__(self, payload=None, priority=0, _id=None):
         if _id is None:
             _id = uuid4().hex
-        if _created is None:
-            _created = time.time()
-        assert isinstance(priority, int), 'priority must be int'
-        super(Message, self).__init__(
-            payload=payload, priority=priority, _id=_id, _created=_created)
+        self.payload = payload
+        assert -8 <= priority <= 7, 'Priority must be int within [-8, 7]'
+        self.priority = priority
+        assert isinstance(_id, str) and len(_id) == 32
+        self.id = _id
 
     def __repr__(self):
         return ('Message(payload={payload}, priority={priority}, '
-                '_id={_id}, _created={_created})').format(**self)
+                '_id={_id}').format(payload=self.payload,
+                                    priority=self.priority,
+                                    _id=self.id)
 
     def __eq__(self, other):
-        return self['_id'] == other['_id']
+        return self.id == other.id
 
 
-def _serialize(message):
-    return msgpack.packb(message)
+class Serializer(object):
 
+    @staticmethod
+    def _priority_to_hex(priority):
+        assert -8 <= priority <= 7
+        return hex(priority if priority < 0 else priority + 16)[2]
 
-def _deserialize(packed):
-    return Message(**msgpack.unpackb(packed))
+    @staticmethod
+    def _hex_to_priority(priority_in_hex):
+        assert priority_in_hex in ('0123456789abcdef')
+        x = int(priority_in_hex, 16)
+        return x if x < 8 else x - 16
+
+    @classmethod
+    def serialize(cls, message):
+        return (message.id +
+                cls._priority_to_hex(message.priority) +
+                msgpack.packb(message.payload))
+
+    @classmethod
+    def deserialize(cls, packed):
+        message_id = cls.get_message_id_from_packed(packed)
+        priority = cls.get_priority_from_packed(packed)
+        log.debug('packed: %r', packed)
+        payload = msgpack.unpackb(packed[33:])
+        return Message(payload=payload, priority=priority, _id=message_id)
+
+    @staticmethod
+    def get_message_id_from_packed(packed):
+        return packed[:32]
+
+    @classmethod
+    def get_priority_from_packed(cls, packed):
+        return cls._hex_to_priority(packed[32])
 
 
 class _OrphanedConsumerCleaner(threading.Thread):
@@ -173,15 +199,14 @@ class PyRediQ(object):
 
     def _get_queue_from_message(self, message):
         pri = max(self.min_priority,
-                  min(message['priority'], self.max_priority))
+                  min(message.priority, self.max_priority))
         return self._get_queue_name(pri)
 
-    def put(self, payload, priority=0, _id=None, _created=None):
-        message = Message(
-            payload=payload, priority=priority, _id=_id, _created=_created)
+    def put(self, payload, priority=0, _id=None):
+        message = Message(payload=payload, priority=priority, _id=_id)
         queue = self._get_queue_from_message(message)
         log.info('%r puts %r', self, message)
-        self._conn.lpush(queue, _serialize(message))
+        self._conn.lpush(queue, Serializer.serialize(message))
 
     def consumer(self):
         return MessageConsumer(self)
@@ -289,24 +314,28 @@ class MessageConsumer(object):
             self._requeue()
 
     def _requeue(self, message=None):
-        msg = _deserialize(self._conn.lindex(self._pq, -1))
-        if message is not None:
-            assert message == msg
+        packed = self._conn.lindex(self._pq, -1)
+        msg = Serializer.deserialize(packed)
+        if message is not None and message.id != msg.id:
+            raise RuntimeError('The message to be requeued is '
+                               'not at the head of processing queue')
         queue = self._mq._get_queue_from_message(msg)
-        item = self._conn.rpoplpush(self._pq, queue)
-        if message is not None:
-            assert message == _deserialize(item)
+        packed = self._conn.rpoplpush(self._pq, queue)
+        if message is not None and \
+           message.id != Serializer.get_message_id_from_packed(packed):
+            raise RuntimeError('The message to be requeued is '
+                               'not at the head of processing queue')
         log.info('%r requeued %r to %r', self, msg, queue)
 
     def _remove(self, message):
-        msg = self._conn.rpop(self._pq)
-        assert message == _deserialize(msg)
+        packed = self._conn.rpop(self._pq)
+        assert message.id == Serializer.get_message_id_from_packed(packed)
         log.info('%r removed %r', self, message)
 
     def _is_processing(self, message):
         for _ in xrange(self._conn.llen(self._pq)):
-            msg = _deserialize(self._conn.lindex(self._pq, -1))
-            if msg == message:
+            packed = self._conn.lindex(self._pq, -1)
+            if message.id == Serializer.get_message_id_from_packed(packed):
                 return True
             self._conn.rpoplpush(self._pq, self._pq)
         return False
@@ -330,7 +359,7 @@ class MessageConsumer(object):
                     packed = self._conn.rpoplpush(queue, self._pq)
                 time.sleep(0)
                 if packed is not None:
-                    message = _deserialize(packed)
+                    message = Serializer.deserialize(packed)
                     log.info('%r got %r', self, message)
                     return message
             else:

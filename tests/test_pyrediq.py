@@ -12,6 +12,7 @@ import redis
 
 from pyrediq.mq import Message
 from pyrediq.mq import PyRediQ
+from pyrediq.mq import Serializer
 from pyrediq import mq
 
 
@@ -65,9 +66,9 @@ def message_consumer(redis, queue, message_count, timeout=None):
             for _ in xrange(message_count):
                 msg = consumer.get(block=True, timeout=timeout)
                 # Simulate some computation after getting the message
-                time.sleep(msg.get('processing_time', 0))
+                time.sleep(msg.payload.get('processing_time', 0))
 
-                if msg.get('reject'):
+                if msg.payload.get('reject'):
                     consumer.reject(msg)
                 else:
                     consumer.ack(msg)
@@ -76,38 +77,33 @@ def message_consumer(redis, queue, message_count, timeout=None):
 def test_default_message_creation():
     msg = Message()
 
-    log.debug('Check required fields')
-    expected = ['_created', '_id', 'payload', 'priority']
-    assert sorted(msg.keys()) == expected
-
     log.debug('Check defaults')
-    assert isinstance(msg['_created'], float)
-    assert isinstance(msg['_id'], str)
-    assert msg['payload'] is None
-    assert msg['priority'] == 0
+    assert isinstance(msg.id, str) and len(msg.id) == 32
+    assert msg.payload is None
+    assert msg.priority == 0
 
 
 def test_message_creation():
     with pytest.raises(AssertionError) as ei:
         Message(priority='sfjei')
-    assert 'must be int' in ei.value.message
+    assert 'must be int within' in ei.value.message
 
-    expected = {'payload': {'test': 'value'}, 'priority': 2,
-                '_id': 'someid', '_created': time.time()}
+    expected = {'payload': {'test': 'value'}, 'priority': 2, '_id': '0' * 32}
     msg = Message(**expected)
-    for field in ['_created', '_id', 'payload', 'priority']:
-        assert msg[field] == expected[field]
+    assert msg.id == expected['_id']
+    for field in ['payload', 'priority']:
+        assert getattr(msg, field) == expected[field]
 
 
 def test_message_comparison():
     msg = Message()
     assert msg != Message()
-    assert msg == mq._deserialize(mq._serialize(msg))
+    assert msg == Serializer.deserialize(Serializer.serialize(msg))
 
 
 def test_message_serialization():
     msg = Message()
-    assert msg == mq._deserialize(mq._serialize(msg))
+    assert msg == Serializer.deserialize(Serializer.serialize(msg))
 
 
 def test_single_consumer(queue, caplog):
