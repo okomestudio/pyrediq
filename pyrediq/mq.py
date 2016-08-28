@@ -47,24 +47,24 @@ class Message(object):
 class Serializer(object):
 
     @staticmethod
-    def _priority_to_hex(priority):
+    def _priority_to_binary(priority):
         assert -8 <= priority <= 7
-        return hex(priority if priority < 0 else priority + 16)[2]
+        return str(bytearray([priority + 256 if priority < 0 else priority]))
 
     @staticmethod
-    def _hex_to_priority(priority_in_hex):
-        assert priority_in_hex in '0123456789abcdef'
-        x = int(priority_in_hex, 16)
-        return x if x < 8 else x - 16
+    def _binary_to_priority(binary):
+        x = int(binary.encode('hex'), 16)
+        return x if x < 128 else x - 256
 
     @classmethod
     def serialize(cls, message):
         return (message.id +
-                cls._priority_to_hex(message.priority) +
+                cls._priority_to_binary(message.priority) +
                 msgpack.packb(message.payload))
 
     @classmethod
     def deserialize(cls, packed):
+        log.debug('Deserializing %r', packed)
         message_id = cls.get_message_id_from_packed(packed)
         priority = cls.get_priority_from_packed(packed)
         log.debug('packed: %r', packed)
@@ -73,46 +73,45 @@ class Serializer(object):
 
     @staticmethod
     def get_message_id_from_packed(packed):
-        return packed[:32]
+        return str(packed[:32])
 
     @classmethod
     def get_priority_from_packed(cls, packed):
-        return cls._hex_to_priority(packed[32])
+        return cls._binary_to_priority(packed[32])
 
 
-class _OrphanedConsumerCleaner(threading.Thread):
+# class _OrphanedConsumerCleaner(threading.Thread):
 
-    def __init__(self, mq, check_interval, idle_time=None):
-        super(_OrphanedConsumerCleaner, self).__init__()
-        self.mq = mq
-        self.check_interval = check_interval
-        self.idle_time = idle_time
-        self._stop = threading.Event()
-        log.info('%r initialized', self)
+#     def __init__(self, mq, check_interval, idle_time=None):
+#         super(_OrphanedConsumerCleaner, self).__init__()
+#         self.mq = mq
+#         self.check_interval = check_interval
+#         self.idle_time = idle_time
+#         self._stop = threading.Event()
+#         log.info('%r initialized', self)
 
-    def clean_up_orphaned_consumers(self, idle_time=None):
-        idle_time = idle_time if idle_time is not None else self.idle_time
-        log.info('%r is looking for orphaned consumers...', self)
-        for consumer in self.mq._orphaned_consumers(idle_time):
-            log.info('Found orphaned consumer %r. Cleaning up...',
-                     consumer)
-            consumer.cleanup()
+#     def clean_up_orphaned_consumers(self, idle_time=None):
+#         idle_time = idle_time if idle_time is not None else self.idle_time
+#         log.info('%r is looking for orphaned consumers...', self)
+#         for consumer in self.mq._orphaned_consumers(idle_time):
+#             log.info('Found orphaned consumer %r. Cleaning up...',
+#                      consumer)
+#             consumer.cleanup()
 
-    def stop(self):
-        self._stop.set()
+#     def stop(self):
+#         self._stop.set()
 
-    def run(self):
-
-        log.info('%r started', self)
-        dt = 1.0
-        time_before_next_check = -1.0
-        while not self._stop.isSet():
-            if time_before_next_check < 0.0:
-                self.clean_up_orphaned_consumers()
-                time_before_next_check = self.check_interval
-            time_before_next_check -= dt
-            time.sleep(dt)
-        log.info('%r stopped', self)
+#     def run(self):
+#         log.info('%r started', self)
+#         dt = 1.0
+#         time_before_next_check = -1.0
+#         while not self._stop.isSet():
+#             if time_before_next_check < 0.0:
+#                 self.clean_up_orphaned_consumers()
+#                 time_before_next_check = self.check_interval
+#             time_before_next_check -= dt
+#             time.sleep(dt)
+#         log.info('%r stopped', self)
 
 
 class PyRediQ(object):
@@ -120,11 +119,10 @@ class PyRediQ(object):
 
     _REDIS_KEY_NAME_ROOT = '__PyRediQ'
 
-    min_priority = -2
-    max_priority = +2
+    min_priority = -8
+    max_priority = +7
 
-    def __init__(self, name, redis=None, min_priority=None, max_priority=None,
-                 orphan_idle_time=None):
+    def __init__(self, name, redis=None, orphan_idle_time=None):
         if redis is None:
             redis = StrictRedis()
         elif not isinstance(redis, StrictRedis):
@@ -133,27 +131,21 @@ class PyRediQ(object):
 
         self.name = name
 
-        if min_priority is not None:
-            self.min_priority = min_priority
-        if max_priority is not None:
-            self.max_priority = max_priority
-
         self._queues = [self._get_queue_name(i) for i
                         in xrange(self.min_priority, self.max_priority + 1)]
 
-        # periodically check if there are orphan consumers
-        self._orphan_check = _OrphanedConsumerCleaner(
-            self, MessageConsumer.HEARTBEAT_INTERVAL,
-            idle_time=orphan_idle_time)
-        self._orphan_check.clean_up_orphaned_consumers(0.0)
-        self._orphan_check.start()
+        # self._orphan_check = _OrphanedConsumerCleaner(
+        #     self, MessageConsumer.HEARTBEAT_INTERVAL,
+        #     idle_time=orphan_idle_time)
+        # self._orphan_check.start()
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._orphan_check.stop()
-        self._orphan_check.join()
+        # self._orphan_check.stop()
+        # self._orphan_check.join()
+        pass
 
     @property
     def redis_conn(self):
@@ -167,17 +159,18 @@ class PyRediQ(object):
         return '{}:p:{:+d}'.format(self.redis_key_prefix, priority)
 
     @property
-    def _consumers(self):
+    def consumers(self):
         return [MessageConsumer(self, id=id) for id in self._conn.hkeys(
             '{}:c:last_seen'.format(self.redis_key_prefix))]
 
-    def _orphaned_consumers(self, idle_time=None):
-        return [consumer for consumer in self._consumers
-                if consumer.is_orphaned(idle_time)]
+    # def _orphaned_consumers(self, idle_time=None):
+    #     return [consumer for consumer in self.consumers
+    #             if consumer.is_orphaned(idle_time)]
 
     def is_empty(self):
         qs = self._conn.keys(self.redis_key_prefix + ':p:*')
-        qs.extend(self._conn.keys(self.redis_key_prefix + ':c:*'))
+        # qs.extend(self._conn.keys(self.redis_key_prefix + ':c:*'))
+        log.debug('Testing for queue emptiness found: %r', qs)
         return not bool(qs)
 
     def purge(self):
@@ -189,8 +182,8 @@ class PyRediQ(object):
 
         """
         log.warning('Purging %r...', self)
-        self._orphan_check.stop()
-        self._orphan_check.join()
+        # self._orphan_check.stop()
+        # self._orphan_check.join()
         keys = self._conn.keys(self.redis_key_prefix + ':*')
         if keys:
             log.debug('Redis keys to be removed: %s', ' '.join(keys))
@@ -212,30 +205,42 @@ class PyRediQ(object):
         return MessageConsumer(self)
 
 
-class _HeartBeater(threading.Thread):
+# class _HeartBeat(threading.Thread):
 
-    def __init__(self, consumer, beat_interval):
-        super(_HeartBeater, self).__init__()
-        self.consumer = consumer
-        self.beat_interval = beat_interval
-        self._stop = threading.Event()
+#     def __init__(self, consumer, beat_interval):
+#         super(_HeartBeat, self).__init__()
+#         self.consumer = consumer
+#         self.beat_interval = beat_interval
+#         self._stop = threading.Event()
 
-    def stop(self):
-        self._stop.set()
+#     def get_last_beat_time(self):
+#         """Get the timestamp of the last time hearbeat occurred.
 
-    def run(self):
-        dt = 1.0
-        time_before_next_check = -1.0
-        while not self._stop.isSet():
-            if time_before_next_check < 0.0:
-                log.info('%r has a heartbeat', self.consumer)
-                self.consumer._conn.hset(
-                    self.consumer._last_seen_key, self.consumer.id,
-                    str(time.time()))
-                time_before_next_check = self.beat_interval
-            time_before_next_check -= dt
-            time.sleep(dt)
-        log.info('%r is stopped', self)
+#         :rtype: :class:`float`
+
+#         """
+#         return float(self.consumer._conn.hget(
+#             self.consumer._last_seen_key, self.consumer.id))
+
+#     def stop(self):
+#         self._stop.set()
+
+#     def run(self):
+#         dt = 1.0
+#         time_before_next_check = -1.0
+#         while not self._stop.isSet():
+#             if time_before_next_check < 0.0:
+#                 log.info('%r has a heartbeat', self.consumer)
+#                 self.consumer._conn.hset(
+#                     self.consumer._last_seen_key, self.consumer.id,
+#                     str(time.time()))
+#                 time_before_next_check = self.beat_interval
+#             time_before_next_check -= dt
+#             time.sleep(dt)
+
+#         self.consumer._conn.hdel(
+#             self.consumer._last_seen_key, self.consumer.id)
+#         log.info('%r is stopped', self)
 
 
 class MessageConsumer(object):
@@ -247,16 +252,18 @@ class MessageConsumer(object):
 
     HEARTBEAT_INTERVAL = 30.0
 
-    def __init__(self, mq, id=None, start_heartbeat=True):
+    def __init__(self, mq, id=None):
         self._mq = mq
         self.id = uuid4().hex if id is None else id
 
         self._pq = '{}:c:{}'.format(self._mq.redis_key_prefix, self.id)
-        self._last_seen_key = '{}:c:last_seen'.format(
-            self._mq.redis_key_prefix)
+        # self._last_seen_key = '{}:c:last_seen'.format(
+        #     self._mq.redis_key_prefix)
 
         self._redis_lock_name = ':'.join(
             [self._mq._REDIS_KEY_NAME_ROOT, self._mq.name])
+
+        # self._heartbeat = _HeartBeat(self, self.HEARTBEAT_INTERVAL)
 
         log.info('%r started', self)
 
@@ -264,7 +271,7 @@ class MessageConsumer(object):
         return '<MessageConsumer {}>'.format(self.id)
 
     def __enter__(self):
-        self.start_heartbeat()
+        # self._heartbeat.start()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -278,27 +285,23 @@ class MessageConsumer(object):
     def _conn(self):
         return self._mq._conn
 
-    def start_heartbeat(self):
-        self._hb = _HeartBeater(self, self.HEARTBEAT_INTERVAL)
-        self._hb.start()
+    # @property
+    # def _last_seen(self):
+    #     """Get the timestamp of the last heartbeat. :obj:`None` if it has
+    #     not had any.
 
-    def stop_heartbeat(self):
-        if hasattr(self, '_hb'):
-            self._hb.stop()
-        self._conn.hdel(self._last_seen_key, self.id)
+    #     """
+    #     try:
+    #         return self._heartbeat.get_last_beat_time()
+    #         # return float(self._conn.hget(self._last_seen_key, self.id))
+    #     except Exception:
+    #         return None
 
-    @property
-    def _last_seen(self):
-        try:
-            return float(self._conn.hget(self._last_seen_key, self.id))
-        except Exception:
-            return None
-
-    def is_orphaned(self, idle_time=None):
-        if self._last_seen is None:
-            return False
-        dt = (self.HEARTBEAT_INTERVAL * 2. if idle_time is None else idle_time)
-        return bool(time.time() - self._last_seen > dt)
+    # def is_orphaned(self, idle_time=None):
+    #     if self._last_seen is None:
+    #         return False
+    #     dt = (self.HEARTBEAT_INTERVAL * 2. if idle_time is None else idle_time)
+    #     return bool(time.time() - self._last_seen > dt)
 
     def cleanup(self):
         log.info('Cleaning up %r', self)
@@ -306,7 +309,8 @@ class MessageConsumer(object):
             self._flush_processing_queue()
             assert self._conn.llen(self._pq) == 0
             self._conn.delete(self._pq)
-            self.stop_heartbeat()
+            self._heartbeat.stop()
+            self._heartbeat.join()
         log.info('Finished cleaning up %r', self)
 
     def _flush_processing_queue(self):
@@ -357,7 +361,7 @@ class MessageConsumer(object):
             for queue in self._mq._queues:
                 with self._lock():
                     packed = self._conn.rpoplpush(queue, self._pq)
-                time.sleep(0)
+                # time.sleep(0)
                 if packed is not None:
                     message = Serializer.deserialize(packed)
                     log.info('%r got %r', self, message)

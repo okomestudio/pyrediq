@@ -6,6 +6,7 @@ import random
 import string
 import threading
 import time
+from StringIO import StringIO
 
 import pytest
 import redis
@@ -40,6 +41,7 @@ def spawn(func, *args, **kwargs):
 
 def joinall(threads):
     for th in threads:
+        # this should block
         th.join()
 
 
@@ -106,6 +108,12 @@ def test_message_serialization():
     assert msg == Serializer.deserialize(Serializer.serialize(msg))
 
 
+def test_serializer_hex_conversion():
+    f = StringIO(bytearray(range(248, 256) + range(0, 8)))
+    for x in xrange(-8, 8):
+        assert x == mq.Serializer._binary_to_priority(f.read(1))
+
+
 def test_single_consumer(queue, caplog):
     caplog.setLevel(logging.WARNING, logger='redis_lock')
     caplog.setLevel(logging.DEBUG, logger='pyrediq')
@@ -125,4 +133,10 @@ def test_single_consumer(queue, caplog):
     for thread in threads:
         assert thread.is_alive() is False
 
+    assert len(queue.consumers) == 0
     assert queue.is_empty()
+
+
+# def test_clean_up_orphans(queue, caplog):
+#     caplog.setLevel(logging.WARNING, logger='redis_lock')
+#     caplog.setLevel(logging.DEBUG, logger='pyrediq')
