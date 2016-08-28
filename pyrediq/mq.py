@@ -53,7 +53,7 @@ class Serializer(object):
 
     @staticmethod
     def _hex_to_priority(priority_in_hex):
-        assert priority_in_hex in ('0123456789abcdef')
+        assert priority_in_hex in '0123456789abcdef'
         x = int(priority_in_hex, 16)
         return x if x < 8 else x - 16
 
