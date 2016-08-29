@@ -8,16 +8,22 @@ import threading
 import time
 from StringIO import StringIO
 
+import mock
 import pytest
 import redis
 
-from pyrediq.mq import Message
-from pyrediq.mq import PyRediQ
-from pyrediq.mq import Serializer
-from pyrediq import mq
+from pyrediq import PyRediQ
+from pyrediq import QueueEmpty
+from pyrediq.pyrediq import Message
+from pyrediq.pyrediq import MessageConsumer
+from pyrediq.pyrediq import Serializer
+from pyrediq import pyrediq as mq
 
 
 log = logging.getLogger(__name__)
+
+
+TEST_QUEUE_PREFIX = '__PyRediQTest_'
 
 
 def random_chars(n=12):
@@ -26,9 +32,13 @@ def random_chars(n=12):
         for _ in xrange(n))
 
 
+def generate_queue_name():
+    return TEST_QUEUE_PREFIX + random_chars()
+
+
 @pytest.fixture
 def queue():
-    mq = PyRediQ('__PyRediQTest_' + random_chars(), redis.StrictRedis())
+    mq = PyRediQ(generate_queue_name(), redis.StrictRedis())
     yield mq
     mq.purge()
 
@@ -120,7 +130,7 @@ def test_single_consumer(queue, caplog):
 
     msgs = [{'payload': {'message': '{!r}'.format(i)},
              'priority': random.randint(
-                 PyRediQ.min_priority, PyRediQ.max_priority)}
+                 PyRediQ.MIN_PRIORITY, PyRediQ.MAX_PRIORITY)}
             for i in xrange(1)]
 
     threads = []
@@ -140,3 +150,71 @@ def test_single_consumer(queue, caplog):
 # def test_clean_up_orphans(queue, caplog):
 #     caplog.setLevel(logging.WARNING, logger='redis_lock')
 #     caplog.setLevel(logging.DEBUG, logger='pyrediq')
+
+
+def test_consumer_get_message_blocking(queue):
+    with mock.patch('redis.StrictRedis.rpoplpush') as mocked:
+        xs = [None] * 100
+        def f(*args):
+            if xs:
+                return xs.pop(0)
+            else:
+                raise QueueEmpty('bomb')
+        mocked.side_effect = f
+        with pytest.raises(QueueEmpty) as cm:
+            with queue.consumer() as consumer:
+                consumer.get(block=True, timeout=None)
+        assert 'bomb' in cm.value.message
+
+
+def test_consumer_get_message_blocking_with_timeout(queue):
+    t0 = time.time()
+    timeout = 1.0
+    with pytest.raises(QueueEmpty) as cm:
+        with queue.consumer() as consumer:
+            consumer.get(block=True, timeout=timeout)
+    assert time.time() - t0 > timeout
+
+
+def test_consumer_get_message_nonblocking(queue):
+    with pytest.raises(QueueEmpty):
+        with queue.consumer() as consumer:
+            consumer.get(block=False)
+
+
+def test_consumer_ack_invalid(queue):
+    with pytest.raises(ValueError) as cm:
+        with queue.consumer() as consumer:
+            consumer.ack(object())
+    assert 'did not find' in cm.value.message
+
+
+def test_consumer_reject_invalid(queue):
+    with pytest.raises(ValueError) as cm:
+        with queue.consumer() as consumer:
+            consumer.reject(object())
+    assert 'did not find' in cm.value.message
+
+
+def test_basic_workflow():
+    with PyRediQ(generate_queue_name(), redis.StrictRedis()) as queue:
+        queue.put(payload={'ack': True}, priority=+2)
+        queue.put(payload={'reject': True}, priority=-2)
+
+        with queue.consumer() as consumer:
+            msg = consumer.get()
+            assert 'reject' in msg.payload
+            assert msg.priority == -2
+            consumer.reject(msg, requeue=True)
+
+            msg = consumer.get()
+            assert 'reject' in msg.payload
+            assert msg.priority == -2
+            consumer.reject(msg)
+
+            msg = consumer.get()
+            assert 'ack' in msg.payload
+            assert msg.priority == +2
+            consumer.ack(msg)
+
+        queue.purge()
