@@ -99,11 +99,19 @@ class PyRediQ(object):
         self._queues = [self._get_queue_name(i) for i
                         in xrange(self.MIN_PRIORITY, self.MAX_PRIORITY + 1)]
 
+        self.consumers = set()
+
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         pass
+
+    def __len__(self):
+        n = 0
+        for pri in xrange(self.MIN_PRIORITY, self.MAX_PRIORITY + 1):
+            n += self._conn.llen(self._get_queue_name(pri))
+        return n
 
     @property
     def redis_conn(self):
@@ -116,14 +124,8 @@ class PyRediQ(object):
     def _get_queue_name(self, priority):
         return '{}:p:{:+d}'.format(self.redis_key_prefix, priority)
 
-    @property
-    def consumers(self):
-        return [MessageConsumer(self, id=id) for id in self._conn.hkeys(
-            '{}:c:last_seen'.format(self.redis_key_prefix))]
-
     def is_empty(self):
         qs = self._conn.keys(self.redis_key_prefix + ':p:*')
-        # qs.extend(self._conn.keys(self.redis_key_prefix + ':c:*'))
         log.debug('Testing for queue emptiness found: %r', qs)
         return not bool(qs)
 
@@ -181,10 +183,12 @@ class MessageConsumer(object):
         return '<MessageConsumer {}>'.format(self.id)
 
     def __enter__(self):
+        self._mq.consumers.add(self)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.cleanup()
+        self._mq.consumers.remove(self)
 
     def _lock(self):
         return redis_lock.Lock(
@@ -229,7 +233,6 @@ class MessageConsumer(object):
 
         """
         # TODO: this is very inefficient
-        log.debug('HERE %d', self._conn.llen(self._pq))
         for _ in xrange(self._conn.llen(self._pq)):
             packed = self._conn.lindex(self._pq, -1)
             if message.id == Serializer.get_message_id_from_packed(packed):

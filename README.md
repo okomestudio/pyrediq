@@ -2,3 +2,5 @@
 [![Coverage Status](https://coveralls.io/repos/github/okomestudio/pyrediq/badge.svg?branch=development)](https://coveralls.io/github/okomestudio/pyrediq?branch=development)
 
 # pyrediq
+
+A Redis priority messaging queue with Python.

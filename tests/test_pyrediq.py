@@ -76,13 +76,97 @@ def message_consumer(redis, queue, message_count, timeout=None):
         with mq.consumer() as consumer:
             for _ in xrange(message_count):
                 msg = consumer.get(block=True, timeout=timeout)
-                # Simulate some computation after getting the message
-                time.sleep(msg.payload.get('processing_time', 0))
+
+                # trigger exception to simulate failure
+                bomb = msg.payload.get('bomb', False)
+                if bomb:
+                    raise Exception('Bomb exploded')
+
+                # simulate some computation after getting the message
+                proc_time = msg.payload.get('processing_time', 0)
+                time.sleep(proc_time)
 
                 if msg.payload.get('reject'):
                     consumer.reject(msg)
                 else:
                     consumer.ack(msg)
+
+
+def test_single_consumer(queue, caplog):
+    caplog.setLevel(logging.WARNING, logger='redis_lock')
+    caplog.setLevel(logging.DEBUG, logger='pyrediq')
+
+    msgs = [{'payload': {'message': '{!r}'.format(i)},
+             'priority': random.randint(
+                 PyRediQ.MIN_PRIORITY, PyRediQ.MAX_PRIORITY)}
+            for i in xrange(1)]
+
+    threads = []
+    threads.append(spawn(
+        message_consumer, queue.redis_conn, queue.name, len(msgs)))
+
+    message_producer(queue.redis_conn, queue.name, msgs)
+
+    joinall(threads)
+    for thread in threads:
+        assert thread.is_alive() is False
+
+    assert len(queue.consumers) == 0
+    assert queue.is_empty()
+
+
+def test_multiple_consumers(queue, caplog):
+    caplog.setLevel(logging.WARNING, logger='redis_lock')
+    caplog.setLevel(logging.DEBUG, logger='pyrediq')
+
+    n_message = 10
+
+    msgs = [{'payload': {'processing_time': random.random()},
+             'priority': random.randint(
+                 PyRediQ.MIN_PRIORITY, PyRediQ.MAX_PRIORITY)}
+            for i in xrange(n_message)]
+
+    threads = []
+    for _ in xrange(n_message):
+        threads.append(spawn(
+            message_consumer, queue.redis_conn, queue.name, 1))
+
+    message_producer(queue.redis_conn, queue.name, msgs)
+
+    joinall(threads)
+    for thread in threads:
+        assert thread.is_alive() is False
+
+    assert len(queue.consumers) == 0
+    assert queue.is_empty()
+
+
+def test_consumer_fail(queue, caplog):
+    caplog.setLevel(logging.WARNING, logger='redis_lock')
+    caplog.setLevel(logging.DEBUG, logger='pyrediq')
+
+    n_message = 10
+
+    msgs = [{'payload': {'bomb': True,
+                         'processing_time': random.random()},
+             'priority': random.randint(
+                 PyRediQ.MIN_PRIORITY, PyRediQ.MAX_PRIORITY)}
+            for i in xrange(n_message)]
+
+    threads = []
+    for _ in xrange(n_message):
+        threads.append(spawn(
+            message_consumer, queue.redis_conn, queue.name, 1))
+
+    message_producer(queue.redis_conn, queue.name, msgs)
+
+    joinall(threads)
+    for thread in threads:
+        assert thread.is_alive() is False
+
+    assert len(queue.consumers) == 0
+    assert len(queue) == n_message
+    assert not queue.is_empty()
 
 
 def test_default_message_creation():
@@ -121,29 +205,6 @@ def test_serializer_hex_conversion():
     f = StringIO(bytearray(range(248, 256) + range(0, 8)))
     for x in xrange(-8, 8):
         assert x == pyrediq.Serializer._binary_to_priority(f.read(1))
-
-
-def test_single_consumer(queue, caplog):
-    caplog.setLevel(logging.WARNING, logger='redis_lock')
-    caplog.setLevel(logging.DEBUG, logger='pyrediq')
-
-    msgs = [{'payload': {'message': '{!r}'.format(i)},
-             'priority': random.randint(
-                 PyRediQ.MIN_PRIORITY, PyRediQ.MAX_PRIORITY)}
-            for i in xrange(1)]
-
-    threads = []
-    threads.append(spawn(
-        message_consumer, queue.redis_conn, queue.name, len(msgs)))
-
-    message_producer(queue.redis_conn, queue.name, msgs)
-
-    joinall(threads)
-    for thread in threads:
-        assert thread.is_alive() is False
-
-    assert len(queue.consumers) == 0
-    assert queue.is_empty()
 
 
 def test_queue_construction():
@@ -227,6 +288,8 @@ def test_basic_workflow():
         queue.put(payload={'reject': True}, priority=-2)
 
         with queue.consumer() as consumer:
+            assert consumer in queue.consumers
+
             msg = consumer.get()
             assert 'reject' in msg.payload
             assert msg.priority == -2
@@ -241,5 +304,7 @@ def test_basic_workflow():
             assert 'ack' in msg.payload
             assert msg.priority == +2
             consumer.ack(msg)
+
+        assert consumer not in queue.consumers
 
         queue.purge()
