@@ -87,12 +87,12 @@ class PyRediQ(object):
     MIN_PRIORITY = -8
     MAX_PRIORITY = +7
 
-    def __init__(self, name, redis=None):
-        if redis is None:
-            redis = StrictRedis()
-        elif not isinstance(redis, StrictRedis):
-            log.warning('`redis` should be a StrictRedis instance')
-        self._conn = redis
+    def __init__(self, name, redis_conn=None):
+        if redis_conn is None:
+            redis_conn = StrictRedis()
+        elif not isinstance(redis_conn, StrictRedis):
+            raise ValueError('`redis_conn` is a StrictRedis instance')
+        self._conn = redis_conn
 
         self.name = name
 
@@ -206,18 +206,15 @@ class MessageConsumer(object):
         for _ in xrange(self._conn.llen(self._pq)):
             self._requeue()
 
-    def _requeue(self, message=None):
+    def _requeue(self):
+        """Requeue the message in the processing queue back to the priority
+        queue.
+
+        """
         packed = self._conn.lindex(self._pq, -1)
         msg = Serializer.deserialize(packed)
-        if message is not None and message.id != msg.id:
-            raise RuntimeError('The message to be requeued is '
-                               'not at the head of processing queue')
         queue = self._mq._get_queue_from_message(msg)
         packed = self._conn.rpoplpush(self._pq, queue)
-        if message is not None and \
-           message.id != Serializer.get_message_id_from_packed(packed):
-            raise RuntimeError('The message to be requeued is '
-                               'not at the head of processing queue')
         log.info('%r requeued %r to %r', self, msg, queue)
 
     def _remove(self, message):
@@ -225,7 +222,14 @@ class MessageConsumer(object):
         assert message.id == Serializer.get_message_id_from_packed(packed)
         log.info('%r removed %r', self, message)
 
-    def _is_processing(self, message):
+    def _is_in_processing_queue(self, message):
+        """Test if the message is in the processing queue. If found, the
+        message will be placed at the head of processing queue when
+        the method exits.
+
+        """
+        # TODO: this is very inefficient
+        log.debug('HERE %d', self._conn.llen(self._pq))
         for _ in xrange(self._conn.llen(self._pq)):
             packed = self._conn.lindex(self._pq, -1)
             if message.id == Serializer.get_message_id_from_packed(packed):
@@ -268,7 +272,7 @@ class MessageConsumer(object):
 
     def ack(self, message):
         with self._lock():
-            if self._is_processing(message):
+            if self._is_in_processing_queue(message):
                 log.info('%r acked and removed %r', self, message)
                 self._remove(message)
             else:
@@ -277,10 +281,10 @@ class MessageConsumer(object):
 
     def reject(self, message, requeue=False):
         with self._lock():
-            if self._is_processing(message):
+            if self._is_in_processing_queue(message):
                 if requeue:
                     log.info('%r rejected and requeued %r', self, message)
-                    self._requeue(message)
+                    self._requeue()  # message)
                 else:
                     log.info('%r rejected and removed %r', self, message)
                     self._remove(message)

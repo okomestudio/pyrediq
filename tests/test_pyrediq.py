@@ -12,12 +12,11 @@ import mock
 import pytest
 import redis
 
+from pyrediq import pyrediq
 from pyrediq import PyRediQ
 from pyrediq import QueueEmpty
 from pyrediq.pyrediq import Message
-from pyrediq.pyrediq import MessageConsumer
 from pyrediq.pyrediq import Serializer
-from pyrediq import pyrediq as mq
 
 
 log = logging.getLogger(__name__)
@@ -121,7 +120,7 @@ def test_message_serialization():
 def test_serializer_hex_conversion():
     f = StringIO(bytearray(range(248, 256) + range(0, 8)))
     for x in xrange(-8, 8):
-        assert x == mq.Serializer._binary_to_priority(f.read(1))
+        assert x == pyrediq.Serializer._binary_to_priority(f.read(1))
 
 
 def test_single_consumer(queue, caplog):
@@ -147,19 +146,29 @@ def test_single_consumer(queue, caplog):
     assert queue.is_empty()
 
 
-# def test_clean_up_orphans(queue, caplog):
-#     caplog.setLevel(logging.WARNING, logger='redis_lock')
-#     caplog.setLevel(logging.DEBUG, logger='pyrediq')
+def test_queue_construction():
+    queue = PyRediQ(generate_queue_name())
+    assert isinstance(queue._conn, redis.StrictRedis)
+
+    redis_conn = redis.StrictRedis()
+    queue = PyRediQ(generate_queue_name(), redis_conn=redis_conn)
+    assert queue._conn == redis_conn
+
+    with pytest.raises(ValueError) as exc:
+        queue = PyRediQ(generate_queue_name(), redis_conn='dummy')
+    assert 'is a StrictRedis instance' in exc.value.message
 
 
 def test_consumer_get_message_blocking(queue):
     with mock.patch('redis.StrictRedis.rpoplpush') as mocked:
         xs = [None] * 100
+
         def f(*args):
             if xs:
                 return xs.pop(0)
             else:
                 raise QueueEmpty('bomb')
+
         mocked.side_effect = f
         with pytest.raises(QueueEmpty) as cm:
             with queue.consumer() as consumer:
@@ -170,7 +179,7 @@ def test_consumer_get_message_blocking(queue):
 def test_consumer_get_message_blocking_with_timeout(queue):
     t0 = time.time()
     timeout = 1.0
-    with pytest.raises(QueueEmpty) as cm:
+    with pytest.raises(QueueEmpty):
         with queue.consumer() as consumer:
             consumer.get(block=True, timeout=timeout)
     assert time.time() - t0 > timeout
@@ -194,6 +203,22 @@ def test_consumer_reject_invalid(queue):
         with queue.consumer() as consumer:
             consumer.reject(object())
     assert 'did not find' in cm.value.message
+
+
+def test_consumer_is_in_processing_queue(queue):
+    for _ in xrange(2):
+        queue.put(payload='test')
+    with queue.consumer() as consumer:
+        msg = consumer.get()
+        msg_pending = consumer.get()
+        consumer.ack(msg)
+        with pytest.raises(ValueError) as cm:
+            consumer.ack(msg)
+        assert 'did not find' in cm.value.message
+
+    with queue.consumer() as consumer:
+        msg = consumer.get()
+        assert msg == msg_pending
 
 
 def test_basic_workflow():
