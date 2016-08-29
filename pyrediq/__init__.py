@@ -22,8 +22,13 @@
 # ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+from __future__ import absolute_import
+
+from .pyrediq import PyRediQ  # noqa
+from .pyrediq import QueueEmpty  # noqa
+
 
 __version__ = '0.1.0.dev'
 __author__ = 'Taro Sato'
-__author_email__ = 'okomestudio@gmail.net'
+__author_email__ = 'okomestudio@gmail.com'
 __license__ = 'MIT'
