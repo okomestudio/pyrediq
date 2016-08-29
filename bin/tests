@@ -11,7 +11,7 @@ else
   opts=$@
 fi
 
-for package in pytest pytest-cov pytest-capturelog ; do
+for package in pytest pytest-cov pytest-capturelog mock ; do
   if ! python -c "import ${package}" 2> /dev/null; then
     pip install -U ${package}
   fi
