@@ -79,7 +79,7 @@ class Serializer(object):
         return cls._binary_to_priority(packed[32])
 
 
-class PyRediQ(object):
+class PriorityQueue(object):
     """Priority queue implementation using multiple Redis lists."""
 
     _REDIS_KEY_NAME_ROOT = '__PyRediQ'

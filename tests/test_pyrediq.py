@@ -12,11 +12,11 @@ import mock
 import pytest
 import redis
 
-from pyrediq import pyrediq
-from pyrediq import PyRediQ
+from pyrediq import priority_queue
+from pyrediq import PriorityQueue
 from pyrediq import QueueEmpty
-from pyrediq.pyrediq import Message
-from pyrediq.pyrediq import Serializer
+from pyrediq.priority_queue import Message
+from pyrediq.priority_queue import Serializer
 
 
 log = logging.getLogger(__name__)
@@ -37,7 +37,7 @@ def generate_queue_name():
 
 @pytest.fixture
 def queue():
-    mq = PyRediQ(generate_queue_name(), redis.StrictRedis())
+    mq = PriorityQueue(generate_queue_name(), redis.StrictRedis())
     yield mq
     mq.purge()
 
@@ -65,14 +65,14 @@ def message_producer(redis, queue, messages, sleep=None):
             pass
         sleep = donothing
 
-    with PyRediQ(queue, redis) as mq:
+    with PriorityQueue(queue, redis) as mq:
         for msg in messages:
             mq.put(**msg)
             sleep()
 
 
 def message_consumer(redis, queue, message_count, timeout=None):
-    with PyRediQ(queue, redis) as mq:
+    with PriorityQueue(queue, redis) as mq:
         with mq.consumer() as consumer:
             for _ in xrange(message_count):
                 msg = consumer.get(block=True, timeout=timeout)
@@ -98,7 +98,7 @@ def test_single_consumer(queue, caplog):
 
     msgs = [{'payload': {'message': '{!r}'.format(i)},
              'priority': random.randint(
-                 PyRediQ.MIN_PRIORITY, PyRediQ.MAX_PRIORITY)}
+                 PriorityQueue.MIN_PRIORITY, PriorityQueue.MAX_PRIORITY)}
             for i in xrange(1)]
 
     threads = []
@@ -123,7 +123,7 @@ def test_multiple_consumers(queue, caplog):
 
     msgs = [{'payload': {'processing_time': random.random()},
              'priority': random.randint(
-                 PyRediQ.MIN_PRIORITY, PyRediQ.MAX_PRIORITY)}
+                 PriorityQueue.MIN_PRIORITY, PriorityQueue.MAX_PRIORITY)}
             for i in xrange(n_message)]
 
     threads = []
@@ -150,7 +150,7 @@ def test_consumer_fail(queue, caplog):
     msgs = [{'payload': {'bomb': True,
                          'processing_time': random.random()},
              'priority': random.randint(
-                 PyRediQ.MIN_PRIORITY, PyRediQ.MAX_PRIORITY)}
+                 PriorityQueue.MIN_PRIORITY, PriorityQueue.MAX_PRIORITY)}
             for i in xrange(n_message)]
 
     threads = []
@@ -204,19 +204,19 @@ def test_message_serialization():
 def test_serializer_hex_conversion():
     f = StringIO(bytearray(range(248, 256) + range(0, 8)))
     for x in xrange(-8, 8):
-        assert x == pyrediq.Serializer._binary_to_priority(f.read(1))
+        assert x == priority_queue.Serializer._binary_to_priority(f.read(1))
 
 
 def test_queue_construction():
-    queue = PyRediQ(generate_queue_name())
+    queue = PriorityQueue(generate_queue_name())
     assert isinstance(queue._conn, redis.StrictRedis)
 
     redis_conn = redis.StrictRedis()
-    queue = PyRediQ(generate_queue_name(), redis_conn=redis_conn)
+    queue = PriorityQueue(generate_queue_name(), redis_conn=redis_conn)
     assert queue._conn == redis_conn
 
     with pytest.raises(ValueError) as exc:
-        queue = PyRediQ(generate_queue_name(), redis_conn='dummy')
+        queue = PriorityQueue(generate_queue_name(), redis_conn='dummy')
     assert 'is a StrictRedis instance' in exc.value.message
 
 
@@ -283,7 +283,7 @@ def test_consumer_is_in_processing_queue(queue):
 
 
 def test_basic_workflow():
-    with PyRediQ(generate_queue_name(), redis.StrictRedis()) as queue:
+    with PriorityQueue(generate_queue_name(), redis.StrictRedis()) as queue:
         queue.put(payload={'ack': True}, priority=+2)
         queue.put(payload={'reject': True}, priority=-2)
 

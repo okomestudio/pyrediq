@@ -24,8 +24,8 @@
 # SOFTWARE.
 from __future__ import absolute_import
 
-from .pyrediq import PyRediQ  # noqa
-from .pyrediq import QueueEmpty  # noqa
+from .priority_queue import PriorityQueue  # noqa
+from .priority_queue import QueueEmpty  # noqa
 
 
 __version__ = '0.1.0.dev'

@@ -4,16 +4,25 @@
 
 set -e
 
+packagename=pyrediq
+importname=pyrediq
+
 if [[ ! -f setup.py ]]; then
-  echo "ERROR: setup.py not found; run from the package root directory."
+  echo "ERROR: setup.py not found; run from the package root directory"
   exit 1
 fi
 
-# Install the Python package, removing the existing one first to
-# ensure updated package gets installed.
-cmd="import sys; sys.path.remove(''); import pyrediq"
-if python -c "$cmd" 2> /dev/null; then
-  pip uninstall -y pyrediq
+if [[ $# -eq 0 ]]; then
+  opts=()
+else
+  opts=$@
 fi
 
-pip install .
+# install the Python package, removing the existing one first to
+# ensure updated package gets installed
+cmd="import sys; sys.path.remove(''); import $importname"
+if python -c "$cmd" 2> /dev/null; then
+  pip uninstall -y "$packagename"
+fi
+
+pip install "${opts[@]}" .
