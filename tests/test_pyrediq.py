@@ -221,17 +221,13 @@ def test_queue_construction():
 
 
 def test_consumer_get_message_blocking(queue):
-    with mock.patch('redis.StrictRedis.rpoplpush') as mocked:
-        xs = [None] * 100
-
+    with mock.patch('redis.StrictRedis.brpop') as mocked:
         def f(*args):
-            if xs:
-                return xs.pop(0)
-            else:
-                raise QueueEmpty('bomb')
-
+            time.sleep(5)
+            raise Exception('bomb')
         mocked.side_effect = f
-        with pytest.raises(QueueEmpty) as cm:
+
+        with pytest.raises(Exception) as cm:
             with queue.consumer() as consumer:
                 consumer.get(block=True, timeout=None)
         assert 'bomb' in cm.value.message
@@ -239,7 +235,7 @@ def test_consumer_get_message_blocking(queue):
 
 def test_consumer_get_message_blocking_with_timeout(queue):
     t0 = time.time()
-    timeout = 1.0
+    timeout = 1
     with pytest.raises(QueueEmpty):
         with queue.consumer() as consumer:
             consumer.get(block=True, timeout=timeout)

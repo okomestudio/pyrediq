@@ -4,6 +4,7 @@
 """
 from __future__ import absolute_import
 import logging
+import threading
 import time
 from uuid import uuid4
 
@@ -76,15 +77,29 @@ class Serializer(object):
 
     @classmethod
     def get_priority_from_packed(cls, packed):
+        log.debug('get_priority_from_packed got packed %r', packed)
         return cls._binary_to_priority(packed[32])
 
 
 class PriorityQueue(object):
-    """Priority queue implementation using multiple Redis lists."""
+    """Priority queue implementation using multiple Redis lists.
 
+    :type name: :class:`str`
+    :param name: The queue name.
+
+    :type redis_conn: :class:`redis.StrictRedis` object
+    :param redis_conn: The Redis connection client.
+
+    """
+
+    #: The root prefix used for all redis keys related to pyrediq
+    #: queues.
     _REDIS_KEY_NAME_ROOT = '__PyRediQ'
 
+    #: The minimum priority allowed.
     MIN_PRIORITY = -8
+
+    #: The maximum priority allowed.
     MAX_PRIORITY = +7
 
     def __init__(self, name, redis_conn=None):
@@ -94,11 +109,12 @@ class PriorityQueue(object):
             raise ValueError('`redis_conn` is a StrictRedis instance')
         self._conn = redis_conn
 
-        self.name = name
+        self._name = name
 
         self._queues = [self._get_queue_name(i) for i
                         in xrange(self.MIN_PRIORITY, self.MAX_PRIORITY + 1)]
 
+        # active consumers
         self.consumers = set()
 
     def __enter__(self):
@@ -108,35 +124,72 @@ class PriorityQueue(object):
         pass
 
     def __len__(self):
-        n = 0
-        for pri in xrange(self.MIN_PRIORITY, self.MAX_PRIORITY + 1):
-            n += self._conn.llen(self._get_queue_name(pri))
+        n = sum(self._conn.llen(self._get_queue_name(pri)) for pri
+                in xrange(self.MIN_PRIORITY, self.MAX_PRIORITY + 1))
+        n += sum(len(c) for c in self.consumers)
         return n
 
     @property
+    def name(self):
+        """The name of the queue."""
+        return self._name
+
+    @property
     def redis_conn(self):
+        """The redis connection client."""
         return self._conn
 
     @property
     def redis_key_prefix(self):
+        """The redis key prefix used for the queue."""
         return '{}:{}'.format(self._REDIS_KEY_NAME_ROOT, self.name)
 
     def _get_queue_name(self, priority):
-        return '{}:p:{:+d}'.format(self.redis_key_prefix, priority)
+        """Get the queue for the specified priority.
 
-    def is_empty(self):
-        qs = self._conn.keys(self.redis_key_prefix + ':p:*')
-        log.debug('Testing for queue emptiness found: %r', qs)
-        return not bool(qs)
+        :type priority: :class:`int`
+        :param priority: The priority for which the internal queue is
+            obtained.
 
-    def purge(self):
-        """Purge queue.
-
-        WARNING: Before running this, make sure no threads/processes
-        are running using this particular queue. Purging at a wrong
-        timing may leave the info on Redis to be in a broken state.
+        :rtype: :class:`str`
+        :returns: The redis key.
 
         """
+        return '{}:p:{:+d}'.format(self.redis_key_prefix, priority)
+
+    def _get_queue_from_message(self, message):
+        """Given a message, get its priority.
+
+        :type message: :class:`Message` object
+        :param message: The message for which priority is obtained.
+
+        :rtype: :class:`int`
+        :returns: The priority of the message.
+
+        """
+        pri = max(self.MIN_PRIORITY,
+                  min(message.priority, self.MAX_PRIORITY))
+        return self._get_queue_name(pri)
+
+    def is_empty(self):
+        """Test if the queue is empty.
+
+        :rtype: :class:`bool`
+        :returns: :obj:`True` if empty, :obj:`False` if not empty.
+
+        """
+        # qs = self._conn.keys(self.redis_key_prefix + ':p:*')
+        # log.debug('Testing for queue emptiness found: %r', qs)
+        return len(self) == 0
+
+    def purge(self):
+        """Purge the queue.
+
+        :raises: :exception:`RuntimeError` when consumers are active.
+
+        """
+        if self.consumers:
+            raise RuntimeError('Some consumers are still active')
         log.warning('Purging %r...', self)
         keys = self._conn.keys(self.redis_key_prefix + ':*')
         if keys:
@@ -144,101 +197,149 @@ class PriorityQueue(object):
             self._conn.delete(*keys)
         log.warning('%r is purged', self)
 
-    def _get_queue_from_message(self, message):
-        pri = max(self.MIN_PRIORITY,
-                  min(message.priority, self.MAX_PRIORITY))
-        return self._get_queue_name(pri)
+    def put(self, payload, priority=0):
+        """Create a message in the queue.
 
-    def put(self, payload, priority=0, _id=None):
-        message = Message(payload=payload, priority=priority, _id=_id)
+        :param payload: The payload for the new message.
+
+        :type priority: :class:`int`
+        :param priority: The priority for the new message.
+
+        """
+        message = Message(payload=payload, priority=priority)
         queue = self._get_queue_from_message(message)
         log.info('%r puts %r', self, message)
         self._conn.lpush(queue, Serializer.serialize(message))
 
     def consumer(self):
+        """Get a message consumer for the queue.
+
+        :rtype: :class:`MessageConsumer` object
+        :returns: The message consumer for the queue.
+
+        """
         return MessageConsumer(self)
 
 
 class MessageConsumer(object):
-    """Consumer attached to a MQ queue.
+    """Consumer of :class:`PriorityQueue`.
 
-    An object of this class must always be obtained via MQ.consumer.
+    An object of this class is obtained via
+    :meth:`PriorityQueue.consumer`.
+
+    :type queue: :class:`PriorityQueue` object
+    :param queue: The queue from which the consumer consumes messages.
 
     """
 
-    def __init__(self, mq, id=None):
-        self._mq = mq
-        self.id = uuid4().hex if id is None else id
+    def __init__(self, queue):
+        self._queue = queue
+
+        self._id = uuid4().hex
 
         # the processing queue in which currently processed (i.e.,
-        # consumed but not acked/rejected) messages are stored
-        self._pq = '{}:c:{}'.format(self._mq.redis_key_prefix, self.id)
+        # consumed but not acked/rejected) messages by the consumer
+        # are stored
+        self._pq = '{}:c:{}'.format(
+            self._queue.redis_key_prefix, self._id)
 
-        self._redis_lock_name = ':'.join(
-            [self._mq._REDIS_KEY_NAME_ROOT, self._mq.name])
+        self._lock = threading.Lock()
+
+        # self._redis_lock_name = '{}:{}'.format(
+        #     self._queue._REDIS_KEY_NAME_ROOT,
+        #     self._queue.name)
 
         log.info('%r started', self)
 
     def __repr__(self):
         return '<MessageConsumer {}>'.format(self.id)
 
+    def __len__(self):
+        return self._conn.hlen(self._pq)
+
     def __enter__(self):
-        self._mq.consumers.add(self)
+        self._queue.consumers.add(self)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.cleanup()
-        self._mq.consumers.remove(self)
+        self._queue.consumers.remove(self)
 
-    def _lock(self):
-        return redis_lock.Lock(
-            self._conn, self._redis_lock_name, expire=5, auto_renewal=True)
+    @property
+    def id(self):
+        """The identifier which uniquely identifies the consumer."""
+        return self._id
 
     @property
     def _conn(self):
-        return self._mq._conn
+        return self._queue._conn
 
     def cleanup(self):
         log.info('Cleaning up %r', self)
-        with self._lock():
+        with self._lock:
             self._flush_processing_queue()
-            assert self._conn.llen(self._pq) == 0
             self._conn.delete(self._pq)
         log.info('Finished cleaning up %r', self)
 
     def _flush_processing_queue(self):
-        for _ in xrange(self._conn.llen(self._pq)):
-            self._requeue()
+        cursor = 0
+        while 1:
+            cursor, resp = self._conn.hscan(self._pq, cursor)
 
-    def _requeue(self):
-        """Requeue the message in the processing queue back to the priority
-        queue.
+            for field, packed in resp.iteritems():
+                # log.debug('field:%r packed:%r', field, packed)
+                msg = Serializer.deserialize(packed)
+                queue = self._queue._get_queue_from_message(msg)
+                self._conn.lpush(queue, packed)
+                self._conn.hdel(self._pq, field)
+                log.info('%r requeued %r to %r', self, msg, queue)
+
+            if cursor == 0:
+                break
+
+    def _requeue(self, message):
+        """Requeue the last message in the processing queue back to the
+        priority queue.
 
         """
-        packed = self._conn.lindex(self._pq, -1)
-        msg = Serializer.deserialize(packed)
-        queue = self._mq._get_queue_from_message(msg)
-        packed = self._conn.rpoplpush(self._pq, queue)
-        log.info('%r requeued %r to %r', self, msg, queue)
+        packed = self._conn.hget(self._pq, message.id)
+        if packed is None:
+            raise Exception('Message {!r} is not found'.format(message))
+        queue = self._queue._get_queue_from_message(message)
+        self._conn.lpush(queue, packed)
+        self._conn.hdel(self._pq, message.id)
+        log.info('%r requeued %r to %r', self, message, queue)
 
     def _remove(self, message):
-        packed = self._conn.rpop(self._pq)
-        assert message.id == Serializer.get_message_id_from_packed(packed)
-        log.info('%r removed %r', self, message)
+        """Remove the last message from the processing queue.
 
-    def _is_in_processing_queue(self, message):
-        """Test if the message is in the processing queue. If found, the
-        message will be placed at the head of processing queue when
-        the method exits.
+        :rtype: :class:`str`
+        :returns: The packed form of message removed from the
+            processing queue.
 
         """
-        # TODO: this is very inefficient
-        for _ in xrange(self._conn.llen(self._pq)):
-            packed = self._conn.lindex(self._pq, -1)
-            if message.id == Serializer.get_message_id_from_packed(packed):
-                return True
-            self._conn.rpoplpush(self._pq, self._pq)
-        return False
+        resp = self._conn.hdel(self._pq, message.id)
+        if resp != 1:
+            raise ValueError(
+                '{!r} could not be removed from processing queue', message)
+
+    def _push_to_last_of_processing_queue(self, message):
+        """Push the message to the last of the processing queue.
+
+        :type message: :class:`Message`
+        :param message: The message to push to the last of the
+            processing queue.
+
+        :rtype: :class:`bool`
+        :returns: :obj:`True` if the message is successfully pushed to
+        the last of processing queue; :obj:`False` otherwise.
+
+        """
+        try:
+            return self._conn.hexists(self._pq, message.id)
+        except:
+            log.exception('Invalid message detected %r', message)
+            return False
 
     def get(self, block=True, timeout=None):
         """Remove and return a message from the queue.
@@ -252,45 +353,39 @@ class MessageConsumer(object):
         :exception:`QueueEmpty` (timeout is ignored in that case).
 
         """
-        t_called = time.time()
-        while 1:
-            for queue in self._mq._queues:
-                with self._lock():
-                    packed = self._conn.rpoplpush(queue, self._pq)
-                if packed is not None:
-                    message = Serializer.deserialize(packed)
-                    log.info('%r got %r', self, message)
-                    return message
-            else:
-                if block:
-                    if timeout is None:
-                        # yield to other thread, but keep blocking
-                        time.sleep(0)
-                        continue
-                    if time.time() - t_called > timeout:
-                        # timeout has expired
-                        raise QueueEmpty()
-                else:
-                    raise QueueEmpty()
+        timeout = (timeout or 0) if block else 1
+
+        resp = self._conn.brpop(self._queue._queues, timeout)
+        if resp is None:
+            raise QueueEmpty()
+
+        _, packed = resp
+
+        message = Serializer.deserialize(packed)
+        self._conn.hset(self._pq, message.id, packed)
+        log.info('%r got %r', self, message)
+        return message
 
     def ack(self, message):
-        with self._lock():
-            if self._is_in_processing_queue(message):
+        with self._lock:
+            if self._push_to_last_of_processing_queue(message):
                 log.info('%r acked and removed %r', self, message)
                 self._remove(message)
+                log.info('%r removed %r', self, message)
             else:
                 raise ValueError(
                     '{!r} did not find {!r}'.format(self, message))
 
     def reject(self, message, requeue=False):
-        with self._lock():
-            if self._is_in_processing_queue(message):
+        with self._lock:
+            if self._push_to_last_of_processing_queue(message):
                 if requeue:
                     log.info('%r rejected and requeued %r', self, message)
-                    self._requeue()  # message)
+                    self._requeue(message)
                 else:
                     log.info('%r rejected and removed %r', self, message)
                     self._remove(message)
+                    log.info('%r removed %r', self, message)
             else:
                 raise ValueError(
                     '{!r} did not find {!r}'.format(self, message))
