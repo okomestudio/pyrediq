@@ -1,5 +1,43 @@
 # -*- coding: utf-8 -*-
-"""Priority message queue with Redis
+"""priority_queue
+=================
+
+Priority message queue with Redis
+
+
+PriorityQueue
+-------------
+
+.. autoclass:: PriorityQueue
+   :members:
+
+
+MessageConsumer
+---------------
+
+.. autoclass:: MessageConsumer
+   :members:
+
+
+QueueEmpty
+----------
+
+.. autoclass:: QueueEmpty
+   :members:
+
+
+Message
+-------
+
+.. autoclass:: Message
+   :members:
+
+
+Packed
+------
+
+.. autoclass:: Packed
+   :members:
 
 """
 from __future__ import absolute_import
@@ -16,12 +54,21 @@ log = logging.getLogger(__name__)
 
 
 class QueueEmpty(Exception):
-    """Raised when the priority queue is empty."""
+    """The exception raised when a priority queue is empty."""
 
 
 class Message(object):
-    """The unpacked representation of a message exchanged through priority
-    queue.
+    """The unpacked representation of a message exchanged through the
+    priority queue.
+
+    :type payload: :mod:`msgpack` serializable
+    :param payload: The message payload which must be serializable by
+        :mod:`msgpack`.
+
+    :type priority: :class:`int`
+    :param priority: The priority of the message.
+
+    :param _id: Do not use; this is only for internal use.
 
     """
 
@@ -44,7 +91,12 @@ class Message(object):
         return self.id == other.id
 
     def serialize(self):
-        """Serialize the message into its packed represenation."""
+        """Serialize the message into its packed represenation.
+
+        :rtype: :class:`Packed`
+        :returns: The packed representation of the message.
+
+        """
         return Packed.serialize(self)
 
 
@@ -69,11 +121,27 @@ class Packed(str):
 
     @classmethod
     def serialize(cls, message):
+        """Serialize a :class:`Message` object to its :class:`Packed`
+        representation.
+
+        :type message: :class:`Message`
+        :param message: The message to be packed.
+
+        :rtype: :class:`Packed`
+        :returns: The packed representation of the message.
+
+        """
         return cls(message.id +
                    cls._priority_to_binary(message.priority) +
                    msgpack.packb(message.payload))
 
     def deserialize(self):
+        """Deserialize :class:`Packed` object to a :class:`Message`.
+
+        :rtype: :class:`Message`
+        :returns: The unpacked representation of the object.
+
+        """
         log.debug('Deserializing %r', self)
         message_id = self.get_message_id()
         priority = self.get_priority()
@@ -82,46 +150,60 @@ class Packed(str):
         return Message(payload=payload, priority=priority, _id=message_id)
 
     def get_message_id(self):
+        """Get the message ID from the packed representation.
+
+        :rtype: :class:`str`
+        :returns: The message ID.
+
+        """
         return str(self[:32])
 
     def get_priority(self):
+        """Get the message priority from the packed representation.
+
+        :rtype: :class:`int`
+        :returns: The message priority.
+
+        """
         return self._binary_to_priority(self[32])
 
 
 class PriorityQueue(object):
-    """Priority queue implementation using multiple Redis lists.
+    """The priority queue implementation using multiple Redis lists.
 
     :type name: :class:`str`
     :param name: The queue name.
 
-    :type redis_conn: :class:`redis.StrictRedis` object
-    :param redis_conn: The Redis connection client.
+    :type redis_conn: :class:`redis.StrictRedis`
+    :param redis_conn: The Redis connection client. If not provided, a
+        new :class:`~redis.StrictRedis` client is created without any
+        arguments.
 
     """
 
     #: The root prefix used for all redis keys related to pyrediq
     #: queues.
-    _REDIS_KEY_NAME_ROOT = '__PyRediQ'
+    _REDIS_KEY_NAME_ROOT = '__pyrediq'
 
-    #: The minimum priority allowed.
+    #: The minimum priority allowed. (This cannot be changed.)
     MIN_PRIORITY = -8
 
-    #: The maximum priority allowed.
+    #: The maximum priority allowed. (This cannot be changed.)
     MAX_PRIORITY = +7
 
     def __init__(self, name, redis_conn=None):
+        self._name = name
+
         if redis_conn is None:
             redis_conn = StrictRedis()
         elif not isinstance(redis_conn, StrictRedis):
             raise ValueError('`redis_conn` is a StrictRedis instance')
         self._conn = redis_conn
 
-        self._name = name
-
         self._queues = [self._get_internal_queue(i) for i
                         in xrange(self.MIN_PRIORITY, self.MAX_PRIORITY + 1)]
 
-        # active consumers
+        # stores active consumers
         self.consumers = set()
 
     def __enter__(self):
@@ -138,16 +220,16 @@ class PriorityQueue(object):
 
     @property
     def name(self):
-        """The name of the queue."""
+        """The name of the priority queue."""
         return self._name
 
     @property
     def _redis_key_prefix(self):
-        """The redis key prefix used for the queue."""
+        """The redis key prefix used for the priority queue."""
         return '{}:{}'.format(self._REDIS_KEY_NAME_ROOT, self.name)
 
     def _get_internal_queue(self, priority):
-        """Get the queue for the specified priority.
+        """Get the internal queue for the specified priority.
 
         :type priority: :class:`int`
         :param priority: The priority for which the internal queue is
@@ -160,15 +242,19 @@ class PriorityQueue(object):
         return '{}:p:{:+d}'.format(self._redis_key_prefix, priority)
 
     def size(self):
-        """The number of messages in the priority queue.
+        """The number of messages in the priority queue. The message count
+        includes the messages currently processed by active consumers.
 
         :rtype: :class:`int`
+        :returns: The message count.
 
         """
         return len(self)
 
     def is_empty(self):
-        """Test if the queue is empty.
+        """Test if the priority queue is empty. The message count used for the
+        check includes the messages currently processed by active
+        consumers.
 
         :rtype: :class:`bool`
         :returns: :obj:`True` if empty, :obj:`False` if not empty.
@@ -177,7 +263,7 @@ class PriorityQueue(object):
         return self.size() == 0
 
     def purge(self):
-        """Purge the queue.
+        """Purge the priority queue.
 
         :raises: :class:`RuntimeError` when consumers are active.
 
@@ -192,32 +278,33 @@ class PriorityQueue(object):
         log.warning('%r is purged', self)
 
     def put(self, payload, priority=0):
-        """Create a message in the queue.
+        """Create a new message in the priority queue.
 
-        :param payload: The payload for the new message.
+        :type payload: :mod:`msgpack` serializable
+        :param payload: The payload for a new message.
 
         :type priority: :class:`int`
         :param priority: The priority for the new message. It must be
             in the range of [-8, 7], inclusive, and a value outside
-            the range will be capped.
+            the range will be capped to the min/max.
 
         """
         priority = max(self.MIN_PRIORITY,
                        min(priority, self.MAX_PRIORITY))
         message = Message(payload=payload, priority=priority)
         queue = self._get_internal_queue(message.priority)
-        self._conn.lpush(queue, message.serialize())
+        self._conn.rpush(queue, message.serialize())
         log.info('%r puts %r', self, message)
 
     @contextlib.contextmanager
     def consumer(self):
-        """Get a message consumer for the queue. This method should be used
-        with a context manager (i.e., the `with` statement) so that
-        the appropriate consumer cleanup action gets run once the
+        """Get a message consumer for the priority queue. This method should
+        be used with a context manager (i.e., the `with` statement) so
+        that the appropriate consumer cleanup action gets run once the
         consumer is no longer needed.
 
-        :rtype: :class:`MessageConsumer` object
-        :returns: The message consumer for the queue.
+        :rtype: :class:`MessageConsumer`
+        :returns: The message consumer of the priority queue.
 
         """
         with MessageConsumer(self) as consumer:
@@ -229,12 +316,12 @@ class PriorityQueue(object):
 
 
 class MessageConsumer(object):
-    """Consumer of :class:`PriorityQueue`.
+    """The consumer of messages from :class:`PriorityQueue`.
 
-    An object of this class is obtained via
+    An object of this type is obtained via
     :meth:`PriorityQueue.consumer`.
 
-    :type queue: :class:`PriorityQueue` object
+    :type queue: :class:`PriorityQueue`
     :param queue: The queue from which the consumer consumes messages.
 
     """
@@ -274,6 +361,11 @@ class MessageConsumer(object):
         return self._queue._conn
 
     def cleanup(self):
+        """Clean up the consumer. This means all the messages that have been
+        consumed but not acked/rejected are requeued back to the
+        priority queue.
+
+        """
         log.info('Cleaning up %r', self)
         with self._lock:
             self._requeue_all()
@@ -285,8 +377,13 @@ class MessageConsumer(object):
         priority = packed.get_priority()
         queue = self._queue._get_internal_queue(priority)
         try:
-            self._conn.lpush(queue, packed)
+            self._conn.rpush(queue, packed)
         except Exception:
+            # TODO: one thing that could be added back is to requeue
+            # orphaned consumed messages like it used to be done. for
+            # now, let's see how this work
+            log.error('Pushing to Redis queue failed; '
+                      'unacked/unrejected may be lost!')
             raise
         else:
             self._conn.hdel(self._consumed, message_id)
@@ -305,7 +402,7 @@ class MessageConsumer(object):
     def _requeue(self, message):
         """Requeue the message back to the priority queue.
 
-        :type message: :class:`Message` object
+        :type message: :class:`Message`
         :param message: The message to be requeued.
 
         """
@@ -316,12 +413,8 @@ class MessageConsumer(object):
     def _remove(self, message):
         """Remove the message.
 
-        :type message: :class:`Message` object
+        :type message: :class:`Message`
         :param message: The message to be removed.
-
-        :rtype: :class:`str`
-        :returns: The packed form of message removed from the
-            processing queue.
 
         """
         resp = self._conn.hdel(self._consumed, message.id)
@@ -330,7 +423,7 @@ class MessageConsumer(object):
                 '{!r} could not be removed from processing queue', message)
 
     def get(self, block=True, timeout=None):
-        """Get a message from the priority queue.
+        """Consume a message from the priority queue.
 
         :type block: :class:`bool`
         :param block: If :obj:`True` and `timeout` is :obj:`None` (the
@@ -351,7 +444,7 @@ class MessageConsumer(object):
         """
         timeout = (timeout or 0) if block else 1
 
-        resp = self._conn.brpop(self._queue._queues, timeout)
+        resp = self._conn.blpop(self._queue._queues, timeout)
         if resp is None:
             raise QueueEmpty()
         try:
@@ -362,7 +455,7 @@ class MessageConsumer(object):
             log.exception('Problem getting a message... rolling back')
             priority = packed.get_priority()
             queue = self._queue._get_internal_queue(priority)
-            self._conn.lpush(queue, packed)
+            self._conn.rpush(queue, packed)
             raise
         log.info('%r got %r', self, message)
         return message

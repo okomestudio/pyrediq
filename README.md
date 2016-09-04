@@ -3,4 +3,5 @@
 
 # pyrediq
 
-A Redis priority messaging queue with Python.
+`pyrediq` (py-re-ddi-ck) is a Python (2.7) library for a priority
+messaging queue using Redis.

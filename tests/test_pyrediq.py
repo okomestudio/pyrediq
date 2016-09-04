@@ -53,7 +53,7 @@ def joinall(threads):
         th.join()
 
 
-def message_producer(redis, queue, messages, sleep=None):
+def message_producer(redis_conn, queue_name, messages, sleep=None):
     """Simulates a function producing messages."""
     if inspect.isfunction(sleep):
         pass
@@ -64,35 +64,34 @@ def message_producer(redis, queue, messages, sleep=None):
             pass
         sleep = donothing
 
-    with PriorityQueue(queue, redis) as mq:
-        for msg in messages:
-            mq.put(**msg)
-            sleep()
+    queue = PriorityQueue(queue_name, redis_conn)
+    for msg in messages:
+        queue.put(**msg)
+        sleep()
 
 
-def message_consumer(redis, queue, message_count, timeout=None):
-    with PriorityQueue(queue, redis) as mq:
-        with mq.consumer() as consumer:
-            for _ in xrange(message_count):
-                msg = consumer.get(block=True, timeout=timeout)
+def message_consumer(redis_conn, queue_name, message_count, timeout=None):
+    queue = PriorityQueue(queue_name, redis_conn)
+    with queue.consumer() as consumer:
+        for _ in xrange(message_count):
+            msg = consumer.get(block=True, timeout=timeout)
 
-                # trigger exception to simulate failure
-                bomb = msg.payload.get('bomb', False)
-                if bomb:
-                    raise Exception('Bomb exploded')
+            # trigger exception to simulate failure
+            bomb = msg.payload.get('bomb', False)
+            if bomb:
+                raise Exception('Bomb exploded')
 
-                # simulate some computation after getting the message
-                proc_time = msg.payload.get('processing_time', 0)
-                time.sleep(proc_time)
+            # simulate some computation after getting the message
+            proc_time = msg.payload.get('processing_time', 0)
+            time.sleep(proc_time)
 
-                if msg.payload.get('reject'):
-                    consumer.reject(msg)
-                else:
-                    consumer.ack(msg)
+            if msg.payload.get('reject'):
+                consumer.reject(msg)
+            else:
+                consumer.ack(msg)
 
 
 def test_single_consumer(queue, caplog):
-    caplog.setLevel(logging.WARNING, logger='redis_lock')
     caplog.setLevel(logging.DEBUG, logger='pyrediq')
 
     msgs = [{'payload': {'message': '{!r}'.format(i)},
@@ -141,7 +140,6 @@ def test_multiple_consumers(queue, caplog):
 
 
 def test_consumer_fail(queue, caplog):
-    caplog.setLevel(logging.WARNING, logger='redis_lock')
     caplog.setLevel(logging.DEBUG, logger='pyrediq')
 
     n_message = 10
@@ -243,7 +241,7 @@ def test_consumer_len(queue):
 
 
 def test_consumer_get_message_blocking(queue):
-    with mock.patch('redis.StrictRedis.brpop') as mocked:
+    with mock.patch('redis.StrictRedis.blpop') as mocked:
         def f(*args):
             time.sleep(2)
             raise Exception('bomb')
@@ -308,7 +306,7 @@ def test_consumer_requeue_critical_failure(queue):
     queue.put('test')
     with queue.consumer() as consumer:
         msg = consumer.get()
-        with mock.patch('redis.StrictRedis.lpush') as m:
+        with mock.patch('redis.StrictRedis.rpush') as m:
             m.side_effect = Exception('failed')
             with pytest.raises(Exception) as exc:
                 consumer.reject(msg, requeue=True)
@@ -327,6 +325,39 @@ def test_consumer_get_critical_failure(queue):
             assert 'failed' in exc.value.message
         assert 0 == len(consumer)
         assert 1 == queue.size()
+
+
+def test_message_change_priority_within_consumer(queue):
+    payload = 'test'
+    queue.put(payload=payload, priority=3)
+    with queue.consumer() as consumer:
+        msg = consumer.get()
+        assert payload == msg.payload
+        assert 3 == msg.priority
+        consumer.reject(msg)
+        queue.put(msg.payload, priority=-3)
+
+    with queue.consumer() as consumer:
+        msg = consumer.get()
+        assert payload == msg.payload
+        assert -3 == msg.priority
+
+
+def test_message_fifo(queue, caplog):
+    caplog.setLevel(logging.DEBUG, logger='pyrediq')
+    for priority in xrange(-7, 8):
+        for i in xrange(10):
+            payload = {'inserted': i, 'priority': priority}
+            queue.put(payload=payload, priority=priority)
+
+    with queue.consumer() as consumer:
+        for priority in xrange(-7, 8):
+            for i in xrange(10):
+                msg = consumer.get()
+                log.debug('%r', msg.payload)
+                assert i == msg.payload['inserted']
+                assert priority == msg.payload['priority']
+                consumer.ack(msg)
 
 
 def test_basic_workflow():
