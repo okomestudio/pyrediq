@@ -1,4 +1,4 @@
-.. image:: https://circleci.com/gh/okomestudio/pyrediq/tree/development.svg?style=svg
+.. image:: https://circleci.com/gh/okomestudio/pyrediq/tree/development.svg?style=shield
    :target: https://circleci.com/gh/okomestudio/pyrediq/tree/development
 
 .. image:: https://coveralls.io/repos/github/okomestudio/pyrediq/badge.svg?branch=development
@@ -13,8 +13,11 @@ pyrediq
 implementation of priority messaging queue using `Redis`_. The message
 payload is serialized by `MessagePack`_.
 
+`pyrediq` is licensed under the `MIT License (MIT)`_.
+
 .. _MessagePack: http://msgpack.org/
 .. _Redis: http://redis.io/
+.. _MIT License (MIT): https://raw.githubusercontent.com/okomestudio/pyrediq/development/LICENSE.txt
 
 
 Basic Usage
@@ -50,7 +53,7 @@ Basic Usage
            consumer.reject(msg, requeue=True)
 
 To remove all message from a queue and remove the queue itself, run
-:meth:`~pyrediq.PriorityQueue.purge` method:
+`PriorityQueue.purge` method:
 
 .. code-block:: python
 
@@ -60,12 +63,11 @@ To remove all message from a queue and remove the queue itself, run
 Installation
 ------------            
 
-To install :mod:`pyrediq` using :mod:`pip`, run this command on the
-shell::
+To install `pyrediq` using `pip`, run this command on the shell::
 
   pip install pyrediq
 
-To use :mod:`pyrediq`, Redis needs to be installed and running on the
+To use `pyrediq`, Redis needs to be installed and running on the
 computer. For example, on a Debian box, running this command should
 suffice::
   

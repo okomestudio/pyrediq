@@ -12,8 +12,11 @@ Release v\ |version|
 implementation of priority messaging queue using `Redis`_. The message
 payload is serialized by `MessagePack`_.
 
+:mod:`pyrediq` is licensed under the `MIT License (MIT)`_.
+
 .. _MessagePack: http://msgpack.org/
 .. _Redis: http://redis.io/
+.. _MIT License (MIT): https://raw.githubusercontent.com/okomestudio/pyrediq/development/LICENSE.txt
 
 
 Basic Usage
