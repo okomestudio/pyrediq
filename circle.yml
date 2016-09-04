@@ -1,0 +1,23 @@
+general:
+  branches:
+    only:
+      - master
+      - development
+
+machine:
+  python:
+    version: 2.7.11
+  services:
+    - redis
+
+dependencies:
+  override:
+    - pip install -e .
+
+test:
+  pre:
+    - pip install -U coveralls
+  override:
+    - bin/tests
+  post:
+    - coveralls

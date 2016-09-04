@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+#!/bin/bash
 #
 # The MIT License (MIT)
 # Copyright (c) 2016 Taro Sato
@@ -22,13 +22,27 @@
 # ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
-from __future__ import absolute_import
 
-from .priority_queue import PriorityQueue  # noqa
-from .priority_queue import QueueEmpty  # noqa
+# Run tests and report coverage.
 
+set -e
 
-__version__ = '0.2.0.dev'
-__author__ = 'Taro Sato'
-__author_email__ = 'okomestudio@gmail.com'
-__license__ = 'MIT'
+opts=(-v
+       --cov=pyrediq
+       --cov-report term-missing
+       --log-format="%(asctime)s %(levelname)s %(thread)d %(message)s")
+
+# Tests to run can be specified explicitly or all tests are run:
+if [[ $# -eq 0 ]]; then
+  opts+=(tests/)
+else
+  opts+=("$@")
+fi
+
+for package in pytest pytest-cov pytest-capturelog mock ; do
+  if ! python -c "import $package" 2> /dev/null; then
+    pip install -U "$package"
+  fi
+done
+
+pytest "${opts[@]}"
