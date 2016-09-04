@@ -3,13 +3,12 @@
 
 """
 from __future__ import absolute_import
+import contextlib
 import logging
 import threading
-import time
 from uuid import uuid4
 
 import msgpack
-import redis_lock
 from redis import StrictRedis
 
 
@@ -17,11 +16,12 @@ log = logging.getLogger(__name__)
 
 
 class QueueEmpty(Exception):
-    pass
+    """Raised when the priority queue is empty."""
 
 
 class Message(object):
-    """Message to be passed around.
+    """The unpacked representation of a message exchanged through priority
+    queue.
 
     """
 
@@ -43,8 +43,19 @@ class Message(object):
     def __eq__(self, other):
         return self.id == other.id
 
+    def serialize(self):
+        """Serialize the message into its packed represenation."""
+        return Packed.serialize(self)
 
-class Serializer(object):
+
+class Packed(str):
+    """The packed representation of a message. The :class:`str`-casted
+    value is stored in Redis.
+
+    """
+
+    def __new__(cls, packed):
+        return str.__new__(cls, packed)
 
     @staticmethod
     def _priority_to_binary(priority):
@@ -58,27 +69,23 @@ class Serializer(object):
 
     @classmethod
     def serialize(cls, message):
-        return (message.id +
-                cls._priority_to_binary(message.priority) +
-                msgpack.packb(message.payload))
+        return cls(message.id +
+                   cls._priority_to_binary(message.priority) +
+                   msgpack.packb(message.payload))
 
-    @classmethod
-    def deserialize(cls, packed):
-        log.debug('Deserializing %r', packed)
-        message_id = cls.get_message_id_from_packed(packed)
-        priority = cls.get_priority_from_packed(packed)
-        log.debug('packed: %r', packed)
-        payload = msgpack.unpackb(packed[33:])
+    def deserialize(self):
+        log.debug('Deserializing %r', self)
+        message_id = self.get_message_id()
+        priority = self.get_priority()
+        log.debug('packed: %r', self)
+        payload = msgpack.unpackb(self[33:])
         return Message(payload=payload, priority=priority, _id=message_id)
 
-    @staticmethod
-    def get_message_id_from_packed(packed):
-        return str(packed[:32])
+    def get_message_id(self):
+        return str(self[:32])
 
-    @classmethod
-    def get_priority_from_packed(cls, packed):
-        log.debug('get_priority_from_packed got packed %r', packed)
-        return cls._binary_to_priority(packed[32])
+    def get_priority(self):
+        return self._binary_to_priority(self[32])
 
 
 class PriorityQueue(object):
@@ -111,7 +118,7 @@ class PriorityQueue(object):
 
         self._name = name
 
-        self._queues = [self._get_queue_name(i) for i
+        self._queues = [self._get_internal_queue(i) for i
                         in xrange(self.MIN_PRIORITY, self.MAX_PRIORITY + 1)]
 
         # active consumers
@@ -124,7 +131,7 @@ class PriorityQueue(object):
         pass
 
     def __len__(self):
-        n = sum(self._conn.llen(self._get_queue_name(pri)) for pri
+        n = sum(self._conn.llen(self._get_internal_queue(pri)) for pri
                 in xrange(self.MIN_PRIORITY, self.MAX_PRIORITY + 1))
         n += sum(len(c) for c in self.consumers)
         return n
@@ -135,16 +142,11 @@ class PriorityQueue(object):
         return self._name
 
     @property
-    def redis_conn(self):
-        """The redis connection client."""
-        return self._conn
-
-    @property
-    def redis_key_prefix(self):
+    def _redis_key_prefix(self):
         """The redis key prefix used for the queue."""
         return '{}:{}'.format(self._REDIS_KEY_NAME_ROOT, self.name)
 
-    def _get_queue_name(self, priority):
+    def _get_internal_queue(self, priority):
         """Get the queue for the specified priority.
 
         :type priority: :class:`int`
@@ -155,21 +157,15 @@ class PriorityQueue(object):
         :returns: The redis key.
 
         """
-        return '{}:p:{:+d}'.format(self.redis_key_prefix, priority)
+        return '{}:p:{:+d}'.format(self._redis_key_prefix, priority)
 
-    def _get_queue_from_message(self, message):
-        """Given a message, get its priority.
-
-        :type message: :class:`Message` object
-        :param message: The message for which priority is obtained.
+    def size(self):
+        """The number of messages in the priority queue.
 
         :rtype: :class:`int`
-        :returns: The priority of the message.
 
         """
-        pri = max(self.MIN_PRIORITY,
-                  min(message.priority, self.MAX_PRIORITY))
-        return self._get_queue_name(pri)
+        return len(self)
 
     def is_empty(self):
         """Test if the queue is empty.
@@ -178,20 +174,18 @@ class PriorityQueue(object):
         :returns: :obj:`True` if empty, :obj:`False` if not empty.
 
         """
-        # qs = self._conn.keys(self.redis_key_prefix + ':p:*')
-        # log.debug('Testing for queue emptiness found: %r', qs)
-        return len(self) == 0
+        return self.size() == 0
 
     def purge(self):
         """Purge the queue.
 
-        :raises: :exception:`RuntimeError` when consumers are active.
+        :raises: :class:`RuntimeError` when consumers are active.
 
         """
         if self.consumers:
             raise RuntimeError('Some consumers are still active')
         log.warning('Purging %r...', self)
-        keys = self._conn.keys(self.redis_key_prefix + ':*')
+        keys = self._conn.keys(self._redis_key_prefix + ':*')
         if keys:
             log.debug('Redis keys to be removed: %s', ' '.join(keys))
             self._conn.delete(*keys)
@@ -203,22 +197,35 @@ class PriorityQueue(object):
         :param payload: The payload for the new message.
 
         :type priority: :class:`int`
-        :param priority: The priority for the new message.
+        :param priority: The priority for the new message. It must be
+            in the range of [-8, 7], inclusive, and a value outside
+            the range will be capped.
 
         """
+        priority = max(self.MIN_PRIORITY,
+                       min(priority, self.MAX_PRIORITY))
         message = Message(payload=payload, priority=priority)
-        queue = self._get_queue_from_message(message)
+        queue = self._get_internal_queue(message.priority)
+        self._conn.lpush(queue, message.serialize())
         log.info('%r puts %r', self, message)
-        self._conn.lpush(queue, Serializer.serialize(message))
 
+    @contextlib.contextmanager
     def consumer(self):
-        """Get a message consumer for the queue.
+        """Get a message consumer for the queue. This method should be used
+        with a context manager (i.e., the `with` statement) so that
+        the appropriate consumer cleanup action gets run once the
+        consumer is no longer needed.
 
         :rtype: :class:`MessageConsumer` object
         :returns: The message consumer for the queue.
 
         """
-        return MessageConsumer(self)
+        with MessageConsumer(self) as consumer:
+            self.consumers.add(consumer)
+            try:
+                yield consumer
+            finally:
+                self.consumers.remove(consumer)
 
 
 class MessageConsumer(object):
@@ -234,20 +241,13 @@ class MessageConsumer(object):
 
     def __init__(self, queue):
         self._queue = queue
-
         self._id = uuid4().hex
-
-        # the processing queue in which currently processed (i.e.,
-        # consumed but not acked/rejected) messages by the consumer
-        # are stored
-        self._pq = '{}:c:{}'.format(
-            self._queue.redis_key_prefix, self._id)
-
         self._lock = threading.Lock()
 
-        # self._redis_lock_name = '{}:{}'.format(
-        #     self._queue._REDIS_KEY_NAME_ROOT,
-        #     self._queue.name)
+        # redis hash hodling the messages that have been consumed but
+        # have not been acked/rejected
+        self._consumed = '{}:c:{}'.format(
+            self._queue._redis_key_prefix, self._id)
 
         log.info('%r started', self)
 
@@ -255,15 +255,13 @@ class MessageConsumer(object):
         return '<MessageConsumer {}>'.format(self.id)
 
     def __len__(self):
-        return self._conn.hlen(self._pq)
+        return self._conn.hlen(self._consumed)
 
     def __enter__(self):
-        self._queue.consumers.add(self)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.cleanup()
-        self._queue.consumers.remove(self)
 
     @property
     def id(self):
@@ -272,85 +270,83 @@ class MessageConsumer(object):
 
     @property
     def _conn(self):
+        """The Redis connection client."""
         return self._queue._conn
 
     def cleanup(self):
         log.info('Cleaning up %r', self)
         with self._lock:
-            self._flush_processing_queue()
-            self._conn.delete(self._pq)
+            self._requeue_all()
+            self._conn.delete(self._consumed)
         log.info('Finished cleaning up %r', self)
 
-    def _flush_processing_queue(self):
+    def _requeue_critical(self, packed):
+        message_id = packed.get_message_id()
+        priority = packed.get_priority()
+        queue = self._queue._get_internal_queue(priority)
+        try:
+            self._conn.lpush(queue, packed)
+        except Exception:
+            raise
+        else:
+            self._conn.hdel(self._consumed, message_id)
+            log.info('%r requeued message %s to %r', self, message_id, queue)
+
+    def _requeue_all(self):
+        """Requeue all consumed messages back to the priority queue."""
         cursor = 0
         while 1:
-            cursor, resp = self._conn.hscan(self._pq, cursor)
-
-            for field, packed in resp.iteritems():
-                # log.debug('field:%r packed:%r', field, packed)
-                msg = Serializer.deserialize(packed)
-                queue = self._queue._get_queue_from_message(msg)
-                self._conn.lpush(queue, packed)
-                self._conn.hdel(self._pq, field)
-                log.info('%r requeued %r to %r', self, msg, queue)
-
+            cursor, resp = self._conn.hscan(self._consumed, cursor)
+            for message_id, packed in resp.iteritems():
+                self._requeue_critical(Packed(packed))
             if cursor == 0:
                 break
 
     def _requeue(self, message):
-        """Requeue the last message in the processing queue back to the
-        priority queue.
+        """Requeue the message back to the priority queue.
+
+        :type message: :class:`Message` object
+        :param message: The message to be requeued.
 
         """
-        packed = self._conn.hget(self._pq, message.id)
-        if packed is None:
-            raise Exception('Message {!r} is not found'.format(message))
-        queue = self._queue._get_queue_from_message(message)
-        self._conn.lpush(queue, packed)
-        self._conn.hdel(self._pq, message.id)
-        log.info('%r requeued %r to %r', self, message, queue)
+        message_id = message.id
+        packed = self._conn.hget(self._consumed, message_id)
+        self._requeue_critical(Packed(packed))
 
     def _remove(self, message):
-        """Remove the last message from the processing queue.
+        """Remove the message.
+
+        :type message: :class:`Message` object
+        :param message: The message to be removed.
 
         :rtype: :class:`str`
         :returns: The packed form of message removed from the
             processing queue.
 
         """
-        resp = self._conn.hdel(self._pq, message.id)
+        resp = self._conn.hdel(self._consumed, message.id)
         if resp != 1:
-            raise ValueError(
+            raise AssertionError(
                 '{!r} could not be removed from processing queue', message)
 
-    def _push_to_last_of_processing_queue(self, message):
-        """Push the message to the last of the processing queue.
-
-        :type message: :class:`Message`
-        :param message: The message to push to the last of the
-            processing queue.
-
-        :rtype: :class:`bool`
-        :returns: :obj:`True` if the message is successfully pushed to
-        the last of processing queue; :obj:`False` otherwise.
-
-        """
-        try:
-            return self._conn.hexists(self._pq, message.id)
-        except:
-            log.exception('Invalid message detected %r', message)
-            return False
-
     def get(self, block=True, timeout=None):
-        """Remove and return a message from the queue.
+        """Get a message from the priority queue.
 
-        If `block` is :obj:`True` and `timeout` is :obj:`None` (the
-        default), block until a message is available. If timeout is a
-        positive number, it blocks at most timeout seconds and raises
-        :exception:`QueueEmpty` if no message was available within
-        that time. Otherwise (i.e., `block` is :obj:`False`), return a
-        message if one is immediately available, else raise
-        :exception:`QueueEmpty` (timeout is ignored in that case).
+        :type block: :class:`bool`
+        :param block: If :obj:`True` and `timeout` is :obj:`None` (the
+            default), block until a message is available. If timeout
+            is a positive integer, it blocks at most timeout seconds
+            and raises :class:`QueueEmpty` if no message was
+            available within that time. Otherwise (i.e., `block` is
+            :obj:`False`), return a message if one is immediately
+            available, else raise :class:`QueueEmpty` (timeout is
+            ignored in that case).
+
+        :type timeout: :class:`int` or :obj:`None`
+        :param timeout: The timeout in seconds. Note that due to a
+            limitation of `brpop` command of Redis, a fractional
+            timeout cannot be specified, so the shortest timeout is
+            one second.
 
         """
         timeout = (timeout or 0) if block else 1
@@ -358,34 +354,54 @@ class MessageConsumer(object):
         resp = self._conn.brpop(self._queue._queues, timeout)
         if resp is None:
             raise QueueEmpty()
-
-        _, packed = resp
-
-        message = Serializer.deserialize(packed)
-        self._conn.hset(self._pq, message.id, packed)
+        try:
+            packed = Packed(resp[1])
+            message = packed.deserialize()
+            self._conn.hset(self._consumed, message.id, packed)
+        except Exception:
+            log.exception('Problem getting a message... rolling back')
+            priority = packed.get_priority()
+            queue = self._queue._get_internal_queue(priority)
+            self._conn.lpush(queue, packed)
+            raise
         log.info('%r got %r', self, message)
         return message
 
     def ack(self, message):
+        """Ack the message and remove from the priority queue.
+
+        :type message: :class:`Message`
+        :param message: The message to ack.
+
+        """
         with self._lock:
-            if self._push_to_last_of_processing_queue(message):
-                log.info('%r acked and removed %r', self, message)
+            if self._conn.hexists(self._consumed, message.id):
                 self._remove(message)
-                log.info('%r removed %r', self, message)
+                log.info('%r acked and removed %r', self, message)
             else:
                 raise ValueError(
                     '{!r} did not find {!r}'.format(self, message))
 
     def reject(self, message, requeue=False):
+        """Reject the message. When `requeue` is :obj:`True`, the message will
+        be requeued back to the priority queue. Otherwise
+        (:obj:`False`, which is the default), it will be removed.
+
+        :type message: :class:`Message`
+        :param message: The message to reject.
+
+        :type requeue: :class:`bool`
+        :param requeue: Whether to requeue the rejected message or not.
+
+        """
         with self._lock:
-            if self._push_to_last_of_processing_queue(message):
+            if self._conn.hexists(self._consumed, message.id):
                 if requeue:
-                    log.info('%r rejected and requeued %r', self, message)
                     self._requeue(message)
+                    log.info('%r rejected and requeued %r', self, message)
                 else:
-                    log.info('%r rejected and removed %r', self, message)
                     self._remove(message)
-                    log.info('%r removed %r', self, message)
+                    log.info('%r rejected and removed %r', self, message)
             else:
                 raise ValueError(
                     '{!r} did not find {!r}'.format(self, message))

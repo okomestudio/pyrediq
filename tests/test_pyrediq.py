@@ -12,11 +12,10 @@ import mock
 import pytest
 import redis
 
-from pyrediq import priority_queue
 from pyrediq import PriorityQueue
 from pyrediq import QueueEmpty
 from pyrediq.priority_queue import Message
-from pyrediq.priority_queue import Serializer
+from pyrediq.priority_queue import Packed
 
 
 log = logging.getLogger(__name__)
@@ -103,9 +102,9 @@ def test_single_consumer(queue, caplog):
 
     threads = []
     threads.append(spawn(
-        message_consumer, queue.redis_conn, queue.name, len(msgs)))
+        message_consumer, queue._conn, queue.name, len(msgs)))
 
-    message_producer(queue.redis_conn, queue.name, msgs)
+    message_producer(queue._conn, queue.name, msgs)
 
     joinall(threads)
     for thread in threads:
@@ -129,9 +128,9 @@ def test_multiple_consumers(queue, caplog):
     threads = []
     for _ in xrange(n_message):
         threads.append(spawn(
-            message_consumer, queue.redis_conn, queue.name, 1))
+            message_consumer, queue._conn, queue.name, 1))
 
-    message_producer(queue.redis_conn, queue.name, msgs)
+    message_producer(queue._conn, queue.name, msgs)
 
     joinall(threads)
     for thread in threads:
@@ -156,16 +155,16 @@ def test_consumer_fail(queue, caplog):
     threads = []
     for _ in xrange(n_message):
         threads.append(spawn(
-            message_consumer, queue.redis_conn, queue.name, 1))
+            message_consumer, queue._conn, queue.name, 1))
 
-    message_producer(queue.redis_conn, queue.name, msgs)
+    message_producer(queue._conn, queue.name, msgs)
 
     joinall(threads)
     for thread in threads:
         assert thread.is_alive() is False
 
     assert len(queue.consumers) == 0
-    assert len(queue) == n_message
+    assert queue.size() == n_message
     assert not queue.is_empty()
 
 
@@ -193,18 +192,18 @@ def test_message_creation():
 def test_message_comparison():
     msg = Message()
     assert msg != Message()
-    assert msg == Serializer.deserialize(Serializer.serialize(msg))
+    assert msg == Packed.serialize(msg).deserialize()
 
 
 def test_message_serialization():
     msg = Message()
-    assert msg == Serializer.deserialize(Serializer.serialize(msg))
+    assert msg == Packed.serialize(msg).deserialize()
 
 
 def test_serializer_hex_conversion():
     f = StringIO(bytearray(range(248, 256) + range(0, 8)))
     for x in xrange(-8, 8):
-        assert x == priority_queue.Serializer._binary_to_priority(f.read(1))
+        assert x == Packed._binary_to_priority(f.read(1))
 
 
 def test_queue_construction():
@@ -220,10 +219,33 @@ def test_queue_construction():
     assert 'is a StrictRedis instance' in exc.value.message
 
 
+def test_queue_purge():
+    queue = PriorityQueue(generate_queue_name())
+    with queue.consumer() as consumer:
+        assert consumer in queue.consumers
+        with pytest.raises(RuntimeError):
+            queue.purge()
+
+
+def test_consumer_len(queue):
+    queue.put('1')
+    queue.put('2')
+    with queue.consumer() as consumer:
+        assert 0 == len(consumer)
+        msg1 = consumer.get()
+        assert 1 == len(consumer)
+        msg2 = consumer.get()
+        assert 2 == len(consumer)
+        consumer.ack(msg1)
+        assert 1 == len(consumer)
+        consumer.reject(msg2)
+        assert 0 == len(consumer)
+
+
 def test_consumer_get_message_blocking(queue):
     with mock.patch('redis.StrictRedis.brpop') as mocked:
         def f(*args):
-            time.sleep(5)
+            time.sleep(2)
             raise Exception('bomb')
         mocked.side_effect = f
 
@@ -248,21 +270,25 @@ def test_consumer_get_message_nonblocking(queue):
             consumer.get(block=False)
 
 
+class MockMessage(object):
+    id = 'badid'
+
+
 def test_consumer_ack_invalid(queue):
     with pytest.raises(ValueError) as cm:
         with queue.consumer() as consumer:
-            consumer.ack(object())
+            consumer.ack(MockMessage)
     assert 'did not find' in cm.value.message
 
 
 def test_consumer_reject_invalid(queue):
     with pytest.raises(ValueError) as cm:
         with queue.consumer() as consumer:
-            consumer.reject(object())
+            consumer.reject(MockMessage)
     assert 'did not find' in cm.value.message
 
 
-def test_consumer_is_in_processing_queue(queue):
+def test_consumer_consumed_message_validation(queue):
     for _ in xrange(2):
         queue.put(payload='test')
     with queue.consumer() as consumer:
@@ -276,6 +302,31 @@ def test_consumer_is_in_processing_queue(queue):
     with queue.consumer() as consumer:
         msg = consumer.get()
         assert msg == msg_pending
+
+
+def test_consumer_requeue_critical_failure(queue):
+    queue.put('test')
+    with queue.consumer() as consumer:
+        msg = consumer.get()
+        with mock.patch('redis.StrictRedis.lpush') as m:
+            m.side_effect = Exception('failed')
+            with pytest.raises(Exception) as exc:
+                consumer.reject(msg, requeue=True)
+            assert 'failed' in exc.value.message
+        assert 1 == len(consumer)
+    assert 1 == queue.size()
+
+
+def test_consumer_get_critical_failure(queue):
+    queue.put('test')
+    with queue.consumer() as consumer:
+        with mock.patch('redis.StrictRedis.hset') as m:
+            m.side_effect = Exception('failed')
+            with pytest.raises(Exception) as exc:
+                consumer.get()
+            assert 'failed' in exc.value.message
+        assert 0 == len(consumer)
+        assert 1 == queue.size()
 
 
 def test_basic_workflow():

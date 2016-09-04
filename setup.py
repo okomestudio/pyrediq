@@ -62,5 +62,4 @@ setup(
     url='https://github.com/okomestudio/pyrediq',
     install_requires=[
         'msgpack-python>=0.4.8',
-        'python-redis-lock>=3.1.0',
         'redis>=2.10.5'])
