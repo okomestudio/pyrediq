@@ -1,42 +1,52 @@
 #!/usr/bin/env python2.7
 # -*- coding: utf-8 -*-
 import gevent.monkey; gevent.monkey.patch_all()
-import gevent.pool
 
 import functools
 import logging
 import random
 import time
 
+import gevent.pool
 from pyrediq import PriorityQueue
 from pyrediq import QueueEmpty
 
 
-# logging.basicConfig(level='DEBUG')
+logging.basicConfig(
+    level='DEBUG',
+    format=('%(asctime)s.%(msecs)03d '
+            '%(thread)x:%(levelname)s:%(name)s %(message)s')
+)
 log = logging.getLogger(__name__)
 
 
 TOTAL_MESSAGES = 10000
 
 
-def measure(f):
-    @functools.wraps(f)
-    def decorated():
-        print 'Starting function {}... '.format(f.__name__),
-        q = PriorityQueue('test')
-        for i in xrange(TOTAL_MESSAGES):
-            q.put(i, random.choice(range(-8, 8)))
-        t0 = time.time()
-        f(q)
-        t1 = time.time()
-        q.purge()
-        dt = t1 - t0
-        print 'took {} sec ({} messages/sec)'.format(
-            dt, 1. * TOTAL_MESSAGES / dt)
-    return decorated
+def measure(queue_name):
+    def _measure(f):
+        @functools.wraps(f)
+        def decorated():
+            print 'Starting function {}... '.format(f.__name__),
+            q = PriorityQueue(queue_name)
+
+            pool = gevent.pool.Pool(100)
+            for i in xrange(TOTAL_MESSAGES):
+                pool.spawn(q.put, i, random.choice(range(-8, 8)))
+            pool.join()
+
+            t0 = time.time()
+            f(q)
+            t1 = time.time()
+            # q.purge()
+            dt = t1 - t0
+            print 'took {} sec ({} messages/sec)'.format(
+                dt, 1. * TOTAL_MESSAGES / dt)
+        return decorated
+    return _measure
 
 
-@measure
+@measure('test1')
 def single_consumer_without_threading(q):
     with q.consumer() as c:
         while 1:
@@ -47,30 +57,33 @@ def single_consumer_without_threading(q):
             c.ack(msg)
 
 
-@measure
+@measure('test2')
 def single_consumer_with_multiple_threads(q):
-    pool = gevent.pool.Pool()
 
     with q.consumer() as c:
-        def consume(c):
+        pool = gevent.pool.Pool()
+
+        def consume(c, thread_no):
             while 1:
+                gevent.sleep()
                 try:
                     msg = c.get(block=False)
                 except QueueEmpty:
                     break
                 c.ack(msg)
 
-        for _ in xrange(16):
-            pool.spawn(consume, c)
+        for i in xrange(16):
+            pool.spawn(consume, c, i)
 
-    pool.join()
+        pool.join()
 
 
-@measure
+@measure('test3')
 def multiple_threads_each_with_single_consumer(q):
     def consume():
         with q.consumer() as c:
             while 1:
+                gevent.sleep()
                 try:
                     msg = c.get(block=False)
                 except QueueEmpty:

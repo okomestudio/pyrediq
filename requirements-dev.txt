@@ -1,0 +1,6 @@
+-e .
+coverage>=4.3.4
+mock>=2.0.0
+pytest>=3.0.6
+pytest-cov>=2.4.0
+pytest-capturelog>=0.7

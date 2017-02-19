@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 #
 # The MIT License (MIT)
-# Copyright (c) 2016 Taro Sato
+# Copyright (c) 2016, 2017 Taro Sato
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation files
@@ -37,7 +37,10 @@ import redis
 
 from pyrediq import PriorityQueue
 from pyrediq import QueueEmpty
+from pyrediq.priority_queue import _cleanup
 from pyrediq.priority_queue import Message
+from pyrediq.priority_queue import MessageConsumer
+from pyrediq.priority_queue import orphan_consumer_cleaner
 from pyrediq.priority_queue import Packed
 
 
@@ -132,7 +135,7 @@ def test_single_consumer(queue, caplog):
     for thread in threads:
         assert thread.is_alive() is False
 
-    assert len(queue.consumers) == 0
+    assert len(list(queue._get_consumer_ids())) == 0
     assert queue.is_empty()
 
 
@@ -158,7 +161,7 @@ def test_multiple_consumers(queue, caplog):
     for thread in threads:
         assert thread.is_alive() is False
 
-    assert len(queue.consumers) == 0
+    assert len(list(queue._get_consumer_ids())) == 0
     assert queue.is_empty()
 
 
@@ -184,7 +187,7 @@ def test_consumer_fail(queue, caplog):
     for thread in threads:
         assert thread.is_alive() is False
 
-    assert len(queue.consumers) == 0
+    assert len(list(queue._get_consumer_ids())) == 0
     assert queue.size() == n_message
     assert not queue.is_empty()
 
@@ -240,12 +243,28 @@ def test_queue_construction():
     assert 'is a StrictRedis instance' in exc.value.message
 
 
+@pytest.mark.parametrize('queue_name', [
+    'thisisbad:bad'
+])
+def test_invalid_queue_name(queue_name):
+    with pytest.raises(ValueError):
+        PriorityQueue(queue_name)
+
+
 def test_queue_purge():
     queue = PriorityQueue(generate_queue_name())
-    with queue.consumer() as consumer:
-        assert consumer in queue.consumers
-        with pytest.raises(RuntimeError):
-            queue.purge()
+    queue.put('test')
+
+    consumer = MessageConsumer(queue)
+    assert consumer.id in list(queue._get_consumer_ids())
+    with pytest.raises(RuntimeError):
+        queue.purge()
+
+    consumer.get(block=True)
+    consumer._stop_beat()
+
+    queue.purge()
+    assert len(queue) == 0
 
 
 def test_consumer_len(queue):
@@ -389,7 +408,7 @@ def test_basic_workflow():
         queue.put(payload={'reject': True}, priority=-2)
 
         with queue.consumer() as consumer:
-            assert consumer in queue.consumers
+            assert consumer.id in list(queue._get_consumer_ids())
 
             msg = consumer.get()
             assert 'reject' in msg.payload
@@ -406,6 +425,43 @@ def test_basic_workflow():
             assert msg.priority == +2
             consumer.ack(msg)
 
-        assert consumer not in queue.consumers
+        assert consumer.id not in list(queue._get_consumer_ids())
 
         queue.purge()
+
+
+def test_orphan_consumer():
+    assert orphan_consumer_cleaner._is_running is True
+    orphan_consumer_cleaner.stop()
+    assert orphan_consumer_cleaner._is_running is False
+    orphan_consumer_cleaner._schedule()
+    assert orphan_consumer_cleaner._is_running is True
+
+
+def test_orphan_consumer_cleanup():
+    queue_name = generate_queue_name()
+    redis_conn = redis.StrictRedis()
+
+    with PriorityQueue(queue_name, redis_conn) as queue:
+        queue.put(payload='test', priority=+0)
+        consumer = MessageConsumer(queue)
+        consumer.get(block=False)
+
+        # Simulate orphan
+        consumer._stop_beat()
+
+    with PriorityQueue(queue_name, redis_conn) as queue:
+        orphan_consumer_cleaner._do_cleaning()
+
+        with queue.consumer() as consumer:
+            msg = consumer.get(block=False)
+            assert msg.payload == 'test'
+            consumer.ack(msg)
+
+        queue.purge()
+
+
+@mock.patch.object(orphan_consumer_cleaner, 'stop')
+def test_atexit(stop):
+    _cleanup()
+    stop.assert_called()

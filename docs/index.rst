@@ -51,6 +51,8 @@ Basic Usage
        else:
            consumer.reject(msg, requeue=True)
 
+   queue.close()
+
 To remove all message from a queue and remove the queue itself, run
 :meth:`~pyrediq.PriorityQueue.purge` method:
 
