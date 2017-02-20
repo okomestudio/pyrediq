@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 #
 # The MIT License (MIT)
-# Copyright (c) 2016 Taro Sato
+# Copyright (c) 2016, 2017 Taro Sato
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation files
@@ -64,9 +64,12 @@ Packed
 
 """
 from __future__ import absolute_import
-import contextlib
+import atexit
 import logging
+import re
 import threading
+import time
+from Queue import Queue
 from uuid import uuid4
 
 import msgpack
@@ -191,6 +194,9 @@ class Packed(str):
         return self._binary_to_priority(self[32])
 
 
+_RE_QUEUE_NAME = re.compile(r'^[a-zA-Z0-9_-]+$')
+
+
 class PriorityQueue(object):
     """The priority queue implementation using multiple Redis lists.
 
@@ -215,6 +221,10 @@ class PriorityQueue(object):
     MAX_PRIORITY = +7
 
     def __init__(self, name, redis_conn=None):
+        if not _RE_QUEUE_NAME.match(name):
+            raise ValueError(
+                "Invalid queue name (must consist of alphanumeric characters"
+                " or '-'/'_')")
         self._name = name
 
         if redis_conn is None:
@@ -226,20 +236,37 @@ class PriorityQueue(object):
         self._queues = [self._get_internal_queue(i) for i
                         in xrange(self.MIN_PRIORITY, self.MAX_PRIORITY + 1)]
 
-        # stores active consumers
-        self.consumers = set()
+        orphan_consumer_cleaner.watch(self)
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        pass
+        self.close()
 
     def __len__(self):
         n = sum(self._conn.llen(self._get_internal_queue(pri)) for pri
                 in xrange(self.MIN_PRIORITY, self.MAX_PRIORITY + 1))
-        n += sum(len(c) for c in self.consumers)
+        for consumer_id in self._get_consumer_ids():
+            n += self._conn.llen(self._redis_key_prefix + ':c:' + consumer_id)
         return n
+
+    def close(self):
+        """Close the connection to the queue."""
+        orphan_consumer_cleaner.unwatch(self)
+
+    def _get_consumer_ids(self):
+        """Get the IDs of all consumers associated with this queue.
+
+        :rtype: generator of :class:`str`
+        :returns: The IDs of consumers.
+
+        """
+        consumer_ids = set()
+        for k in self._conn.keys(self._redis_key_prefix + ':c:*'):
+            consumer_ids.add(k.split(':')[-1 - int(k.endswith(':lock'))])
+        for id in consumer_ids:
+            yield id
 
     @property
     def name(self):
@@ -291,8 +318,13 @@ class PriorityQueue(object):
         :raises: :class:`RuntimeError` when consumers are active.
 
         """
-        if self.consumers:
+        try:
+            for consumer_id in self._get_consumer_ids():
+                consumer = MessageConsumer(self, _id=consumer_id)
+                consumer.cleanup()
+        except ConsumerLocked:
             raise RuntimeError('Some consumers are still active')
+
         log.warning('Purging %r...', self)
         keys = self._conn.keys(self._redis_key_prefix + ':*')
         if keys:
@@ -311,6 +343,9 @@ class PriorityQueue(object):
             in the range of [-8, 7], inclusive, and a value outside
             the range will be capped to the min/max.
 
+        :rtype: :class:`str`
+        :returns: The ID of the created message.
+
         """
         priority = max(self.MIN_PRIORITY,
                        min(priority, self.MAX_PRIORITY))
@@ -318,8 +353,8 @@ class PriorityQueue(object):
         queue = self._get_internal_queue(message.priority)
         self._conn.rpush(queue, message.serialize())
         log.info('%r puts %r', self, message)
+        return message.id
 
-    @contextlib.contextmanager
     def consumer(self):
         """Get a message consumer for the priority queue. This method should
         be used with a context manager (i.e., the `with` statement) so
@@ -330,12 +365,11 @@ class PriorityQueue(object):
         :returns: The message consumer of the priority queue.
 
         """
-        with MessageConsumer(self) as consumer:
-            self.consumers.add(consumer)
-            try:
-                yield consumer
-            finally:
-                self.consumers.remove(consumer)
+        return MessageConsumer(self)
+
+
+class ConsumerLocked(Exception):
+    """Raised when a consumer to be created already exists elsewhere."""
 
 
 class MessageConsumer(object):
@@ -349,17 +383,58 @@ class MessageConsumer(object):
 
     """
 
-    def __init__(self, queue):
+    def __init__(self, queue, _id=None):
         self._queue = queue
-        self._id = uuid4().hex
-        self._lock = threading.Lock()
+        self._id = _id or uuid4().hex
 
-        # redis hash hodling the messages that have been consumed but
+        # Redis hash hodling the messages that have been consumed but
         # have not been acked/rejected
         self._consumed = '{}:c:{}'.format(
             self._queue._redis_key_prefix, self._id)
 
+        self._lock_lifetime = 2.0
+        self._lock = self._conn.lock(
+            self._consumed + ':lock', timeout=self._lock_lifetime,
+            thread_local=False)
+        if not self._lock.acquire(blocking=False):
+            raise ConsumerLocked('Consumer {} already locked'.format(self._id))
+
         log.info('%r started', self)
+
+        self._critical = threading.Lock()
+
+        self._beat_interval = 1.0
+        self._beat_time = time.time()
+        self._beat()
+
+    def _beat(self):
+        with self._critical:
+            self._beat_is_scheduled = False
+
+            now = time.time()
+            extend_by = now - self._beat_time
+            self._beat_time = now
+
+            self._schedule_beat()
+
+            # Ensure extension of at least `life_time` seconds, but no
+            # more than twice the `life_time` seconds
+            log.debug('%r is alive at %r, extending lock by %f',
+                      self, self._beat_time, extend_by)
+            self._lock.extend(extend_by)
+
+    def _schedule_beat(self):
+        if not self._beat_is_scheduled:
+            t = self._beat_time + self._beat_interval
+            self._beater = threading.Timer(t - time.time(), self._beat)
+            self._beater.daemon = True
+            self._beater.start()
+            self._beat_is_scheduled = True
+
+    def _stop_beat(self):
+        self._beater.cancel()
+        self._beat_is_scheduled = False
+        self._lock.release()
 
     def __repr__(self):
         return '<MessageConsumer {}>'.format(self.id)
@@ -390,9 +465,10 @@ class MessageConsumer(object):
 
         """
         log.info('Cleaning up %r', self)
-        with self._lock:
+        with self._critical:
             self._requeue_all()
             self._conn.delete(self._consumed)
+            self._stop_beat()
         log.info('Finished cleaning up %r', self)
 
     def _requeue_critical(self, packed):
@@ -443,7 +519,8 @@ class MessageConsumer(object):
         resp = self._conn.hdel(self._consumed, message.id)
         if resp != 1:
             raise AssertionError(
-                '{!r} could not be removed from processing queue', message)
+                '{!r} could not be removed from processing queue ({})'.format(
+                    message, resp))
 
     def get(self, block=True, timeout=None):
         """Consume a message from the priority queue.
@@ -466,10 +543,10 @@ class MessageConsumer(object):
 
         """
         timeout = (timeout or 0) if block else 1
-
         resp = self._conn.blpop(self._queue._queues, timeout)
         if resp is None:
             raise QueueEmpty()
+        self._critical.acquire()
         try:
             packed = Packed(resp[1])
             message = packed.deserialize()
@@ -480,6 +557,8 @@ class MessageConsumer(object):
             queue = self._queue._get_internal_queue(priority)
             self._conn.rpush(queue, packed)
             raise
+        finally:
+            self._critical.release()
         log.info('%r got %r', self, message)
         return message
 
@@ -490,7 +569,7 @@ class MessageConsumer(object):
         :param message: The message to ack.
 
         """
-        with self._lock:
+        with self._critical:
             if self._conn.hexists(self._consumed, message.id):
                 self._remove(message)
                 log.info('%r acked and removed %r', self, message)
@@ -510,7 +589,7 @@ class MessageConsumer(object):
         :param requeue: Whether to requeue the rejected message or not.
 
         """
-        with self._lock:
+        with self._critical:
             if self._conn.hexists(self._consumed, message.id):
                 if requeue:
                     self._requeue(message)
@@ -521,3 +600,101 @@ class MessageConsumer(object):
             else:
                 raise ValueError(
                     '{!r} did not find {!r}'.format(self, message))
+
+
+class ConsumerCleanerWorker(threading.Thread):
+
+    def __init__(self, tasks):
+        super(ConsumerCleanerWorker, self).__init__()
+        self.tasks = tasks
+        self.daemon = True
+        self.start()
+
+    def run(self):
+        while 1:
+            queue, consumer_id = self.tasks.get()
+            try:
+                log.debug('%r cleaning up orphaned consumer %s',
+                          self, consumer_id)
+                consumer = MessageConsumer(queue, _id=consumer_id)
+
+            except ConsumerLocked:
+                log.debug('%r sees consumer %s is in use', self, consumer_id)
+
+            else:
+                consumer.cleanup()
+                log.info('%r cleaned up orphaned consumer %s',
+                         self, consumer_id)
+
+            finally:
+                self.tasks.task_done()
+
+
+class OrphanConsumerCleaner(threading.Thread):
+    """A thread periodically cleans up orphaned consumer artifacts.
+
+    :type num_worker: :class:`int`
+    :param num_worker: Number of workers tasked with clean-up.
+
+    """
+
+    #: Time interval in seconds between clean-up jobs
+    _interval = 5
+
+    def __init__(self, num_worker=64):
+        super(OrphanConsumerCleaner, self).__init__()
+
+        # PriorityQueue's to be watched
+        self.queues = set()
+
+        # Start worker threads
+        self._tasks = Queue(num_worker)
+        for _ in xrange(num_worker):
+            ConsumerCleanerWorker(self._tasks)
+
+        # For scheduled task
+        self._timer = None
+        self._is_running = False
+
+        # Start as a daemon
+        self.daemon = True
+        self.start()
+
+    def watch(self, queue):
+        self.queues.add(queue)
+
+    def unwatch(self, queue):
+        self.queues.remove(queue)
+
+    def run(self):
+        self._run_scheduled()
+
+    def _do_cleaning(self):
+        for queue in self.queues:
+            for consumer_id in queue._get_consumer_ids():
+                self._tasks.put((queue, consumer_id))
+        self._tasks.join()
+
+    def _run_scheduled(self):
+        self._is_running = False
+        self._schedule()
+        self._do_cleaning()
+
+    def _schedule(self):
+        if not self._is_running:
+            self._timer = threading.Timer(self._interval, self._run_scheduled)
+            self._timer.daemon = True
+            self._timer.start()
+            self._is_running = True
+
+    def stop(self):
+        self._timer.cancel()
+        self._is_running = False
+
+
+orphan_consumer_cleaner = OrphanConsumerCleaner()
+
+
+@atexit.register
+def _cleanup():
+    orphan_consumer_cleaner.stop()
