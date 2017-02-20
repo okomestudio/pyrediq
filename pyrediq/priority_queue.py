@@ -343,6 +343,9 @@ class PriorityQueue(object):
             in the range of [-8, 7], inclusive, and a value outside
             the range will be capped to the min/max.
 
+        :rtype: :class:`str`
+        :returns: The ID of the created message.
+
         """
         priority = max(self.MIN_PRIORITY,
                        min(priority, self.MAX_PRIORITY))
@@ -350,6 +353,7 @@ class PriorityQueue(object):
         queue = self._get_internal_queue(message.priority)
         self._conn.rpush(queue, message.serialize())
         log.info('%r puts %r', self, message)
+        return message.id
 
     def consumer(self):
         """Get a message consumer for the priority queue. This method should

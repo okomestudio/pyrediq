@@ -404,8 +404,8 @@ def test_message_fifo(queue, caplog):
 
 def test_basic_workflow():
     with PriorityQueue(generate_queue_name(), redis.StrictRedis()) as queue:
-        queue.put(payload={'ack': True}, priority=+2)
-        queue.put(payload={'reject': True}, priority=-2)
+        id1 = queue.put(payload={'ack': True}, priority=+2)
+        id2 = queue.put(payload={'reject': True}, priority=-2)
 
         with queue.consumer() as consumer:
             assert consumer.id in list(queue._get_consumer_ids())
@@ -413,16 +413,19 @@ def test_basic_workflow():
             msg = consumer.get()
             assert 'reject' in msg.payload
             assert msg.priority == -2
+            assert msg.id == id2
             consumer.reject(msg, requeue=True)
 
             msg = consumer.get()
             assert 'reject' in msg.payload
             assert msg.priority == -2
+            assert msg.id == id2
             consumer.reject(msg)
 
             msg = consumer.get()
             assert 'ack' in msg.payload
             assert msg.priority == +2
+            assert msg.id == id1
             consumer.ack(msg)
 
         assert consumer.id not in list(queue._get_consumer_ids())
