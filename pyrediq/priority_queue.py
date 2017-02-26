@@ -74,6 +74,7 @@ from uuid import uuid4
 
 import msgpack
 from redis import StrictRedis
+from redis.lock import LockError as RedisLockError
 
 
 log = logging.getLogger(__name__)
@@ -81,6 +82,10 @@ log = logging.getLogger(__name__)
 
 class QueueEmpty(Exception):
     """The exception raised when a priority queue is empty."""
+
+
+class ConsumerLocked(Exception):
+    """Raised when a consumer to be created already exists elsewhere."""
 
 
 class Message(object):
@@ -368,10 +373,6 @@ class PriorityQueue(object):
         return MessageConsumer(self)
 
 
-class ConsumerLocked(Exception):
-    """Raised when a consumer to be created already exists elsewhere."""
-
-
 class MessageConsumer(object):
     """The consumer of messages from :class:`PriorityQueue`.
 
@@ -392,19 +393,19 @@ class MessageConsumer(object):
         self._consumed = '{}:c:{}'.format(
             self._queue._redis_key_prefix, self._id)
 
-        self._lock_lifetime = 2.0
+        self._lock_lifetime = 5.0
         self._lock = self._conn.lock(
             self._consumed + ':lock', timeout=self._lock_lifetime,
             thread_local=False)
+
+        self._beat_interval = 1.0
+        self._beat_time = time.time()
         if not self._lock.acquire(blocking=False):
             raise ConsumerLocked('Consumer {} already locked'.format(self._id))
 
         log.info('%r started', self)
 
         self._critical = threading.Lock()
-
-        self._beat_interval = 1.0
-        self._beat_time = time.time()
         self._beat()
 
     def _beat(self):
@@ -415,13 +416,21 @@ class MessageConsumer(object):
             extend_by = now - self._beat_time
             self._beat_time = now
 
-            self._schedule_beat()
+            try:
+                self._lock.extend(extend_by)
+            except RedisLockError:
+                log.exception('%r failed to extend Redis lock', self)
+                if not self._lock.acquire(blocking=False):
+                    raise ConsumerLocked(
+                        'Consumer {} locked after extension failure'.format(
+                            self._id))
+                self._beat_time = time.time()
+                log.warning('%r reclaimed lock', self)
+            else:
+                log.debug('%r is alive at %r, extended lock by %f',
+                          self, self._beat_time, extend_by)
 
-            # Ensure extension of at least `life_time` seconds, but no
-            # more than twice the `life_time` seconds
-            log.debug('%r is alive at %r, extending lock by %f',
-                      self, self._beat_time, extend_by)
-            self._lock.extend(extend_by)
+            self._schedule_beat()
 
     def _schedule_beat(self):
         if not self._beat_is_scheduled:
@@ -688,7 +697,8 @@ class OrphanConsumerCleaner(threading.Thread):
             self._is_running = True
 
     def stop(self):
-        self._timer.cancel()
+        if self._timer is not None:
+            self._timer.cancel()
         self._is_running = False
 
 
