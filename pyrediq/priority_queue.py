@@ -688,7 +688,8 @@ class OrphanConsumerCleaner(threading.Thread):
             self._is_running = True
 
     def stop(self):
-        self._timer.cancel()
+        if self._timer is not None:
+            self._timer.cancel()
         self._is_running = False
 
 
