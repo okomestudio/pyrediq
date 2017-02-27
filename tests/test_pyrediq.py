@@ -47,7 +47,7 @@ from pyrediq.priority_queue import Packed
 log = logging.getLogger(__name__)
 
 
-TEST_QUEUE_PREFIX = '__PyRediQTest_'
+TEST_QUEUE_PREFIX = '__pyrediqtest_'
 
 
 def random_chars(n=12):
