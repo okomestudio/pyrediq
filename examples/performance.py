@@ -13,6 +13,7 @@ from pyrediq import QueueEmpty
 
 
 logging.basicConfig(
+    #level='WARNING',
     level='DEBUG',
     format=('%(asctime)s.%(msecs)03d '
             '%(thread)x:%(levelname)s:%(name)s %(message)s')

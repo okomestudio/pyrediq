@@ -393,11 +393,12 @@ class MessageConsumer(object):
         self._consumed = '{}:c:{}'.format(
             self._queue._redis_key_prefix, self._id)
 
-        self._lock_lifetime = 5.0
+        self._lock_lifetime = 10.0
         self._lock = self._conn.lock(
             self._consumed + ':lock', timeout=self._lock_lifetime,
             thread_local=False)
 
+        self._beater = None
         self._beat_interval = 1.0
         self._beat_time = time.time()
         if not self._lock.acquire(blocking=False):
@@ -412,10 +413,10 @@ class MessageConsumer(object):
         with self._critical:
             self._beat_is_scheduled = False
 
-            now = time.time()
-            extend_by = now - self._beat_time
-            self._beat_time = now
+            pttl = self._conn.pttl(self._consumed + ':lock')
+            extend_by = self._lock_lifetime - pttl / 1000.
 
+            self._beat_time = time.time()
             try:
                 self._lock.extend(extend_by)
             except RedisLockError:
@@ -424,24 +425,26 @@ class MessageConsumer(object):
                     raise ConsumerLocked(
                         'Consumer {} locked after extension failure'.format(
                             self._id))
-                self._beat_time = time.time()
                 log.warning('%r reclaimed lock', self)
             else:
-                log.debug('%r is alive at %r, extended lock by %f',
-                          self, self._beat_time, extend_by)
+                l = (log.warning if extend_by - self._beat_interval > 0.1
+                     else log.debug)
+                l('%r is alive, extended lock by %f', self, extend_by)
 
             self._schedule_beat()
 
     def _schedule_beat(self):
         if not self._beat_is_scheduled:
-            t = self._beat_time + self._beat_interval
-            self._beater = threading.Timer(t - time.time(), self._beat)
+            self._beater = threading.Timer(
+                (self._beat_time + self._beat_interval) - time.time(),
+                self._beat)
             self._beater.daemon = True
             self._beater.start()
             self._beat_is_scheduled = True
 
     def _stop_beat(self):
-        self._beater.cancel()
+        if self._beater:
+            self._beater.cancel()
         self._beat_is_scheduled = False
         self._lock.release()
 
