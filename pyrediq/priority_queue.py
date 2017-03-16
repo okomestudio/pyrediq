@@ -235,7 +235,9 @@ class PriorityQueue(object):
         if redis_conn is None:
             redis_conn = StrictRedis()
         elif not isinstance(redis_conn, StrictRedis):
-            raise ValueError('`redis_conn` is a StrictRedis instance')
+            # Instead of not accepting non-StrictRedis, let's just
+            # warn to allow duck typing
+            log.warning('`redis_conn` should be a StrictRedis instance')
         self._conn = redis_conn
 
         self._queues = [self._get_internal_queue(i) for i
