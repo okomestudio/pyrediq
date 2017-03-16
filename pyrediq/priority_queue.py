@@ -427,8 +427,10 @@ class MessageConsumer(object):
                             self._id))
                 log.warning('%r reclaimed lock', self)
             else:
-                l = (log.warning if extend_by - self._beat_interval > 0.1
-                     else log.debug)
+                if extend_by / self._beat_interval - 1. > 0.5:
+                    l = log.warning
+                else:
+                    l = log.debug
                 l('%r is alive, extended lock by %f', self, extend_by)
 
             self._schedule_beat()

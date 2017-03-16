@@ -28,7 +28,7 @@ from .priority_queue import PriorityQueue  # noqa
 from .priority_queue import QueueEmpty  # noqa
 
 
-__version__ = '0.3.2'
+__version__ = '0.3.3.dev0'
 __author__ = 'Taro Sato'
 __author_email__ = 'okomestudio@gmail.com'
 __license__ = 'MIT'
